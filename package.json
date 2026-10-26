@@ -1,0 +1,15 @@
+{
+  "name": "atlas-dex",
+  "version": "5.0.0",
+  "private": true,
+  "description": "A Pokémon field guide, team planner and living-dex tracker. Dependency-free PWA.",
+  "scripts": {
+    "test": "node tests/run.js",
+    "check": "node --check app.js && node --check sw.js",
+    "serve": "python3 -m http.server 8080"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.0.0",
+    "jsdom": "^25.0.0"
+  }
+}

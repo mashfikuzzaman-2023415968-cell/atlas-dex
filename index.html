@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a1020">
+<meta name="description" content="AtlasDex — discover Pokémon, explore stats, type matchups, build teams and complete your living dex.">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="icon" href="./assets/icon.svg" type="image/svg+xml">
+<title>AtlasDex — The Pokémon Explorer</title>
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<div id="app">
+
+<aside class="sidebar">
+  <a class="brand" href="#/" aria-label="AtlasDex home">
+    <div class="brandmark"><span></span></div>
+    <span>ATLAS<span class="accent">DEX</span><small>THE ULTIMATE FIELD GUIDE</small></span>
+  </a>
+
+  <div class="side-label">DISCOVER</div>
+  <nav aria-label="Main navigation">
+    <a class="navitem active" data-nav="all" href="#/"><span>◈</span> Pokédex <b>↗</b></a>
+    <a class="navitem" data-nav="move" href="#/moves"><span>⚡</span> Moves <b>↗</b></a>
+    <a class="navitem" data-nav="ability" href="#/abilities"><span>✺</span> Abilities <b>↗</b></a>
+    <a class="navitem" data-nav="item" href="#/items"><span>⬙</span> Items <b>↗</b></a>
+  </nav>
+
+  <div class="side-label side-gap">COLLECT</div>
+  <nav aria-label="Collection navigation">
+    <a class="navitem" data-nav="favorites" href="#/favorites"><span>♡</span> Favorites <b id="favCount">0</b></a>
+    <a class="navitem" data-nav="progress" href="#/progress"><span>◉</span> Living Dex <b id="caughtCount">0</b></a>
+    <a class="navitem" data-nav="team" href="#/team"><span>⬢</span> Team Builder <b id="teamCount">0</b></a>
+    <a class="navitem" data-nav="game" href="#/game"><span>◐</span> Who's That? <b id="streakCount">0</b></a>
+  </nav>
+
+  <div class="side-label side-gap">TOOLS</div>
+  <nav aria-label="Tools navigation">
+    <a class="navitem" data-nav="calc" href="#/calc"><span>∑</span> Calculators <b>↗</b></a>
+    <a class="navitem" data-nav="matchups" href="#/matchups"><span>⚔</span> Type Matchups <b>↗</b></a>
+    <a class="navitem" data-nav="compare" href="#/compare"><span>⇄</span> Compare <b id="compareCount">0</b></a>
+    <a class="navitem" data-nav="offline" href="#/offline"><span>◍</span> Offline &amp; Data <b>↗</b></a>
+  </nav>
+
+  <div class="side-label side-gap">GENERATIONS</div>
+  <div class="generation-list" id="sideGens"></div>
+
+  <div class="sidefooter">
+    <div class="online-dot"></div> Powered by PokéAPI
+    <small>Fan-made project · Unofficial</small>
+  </div>
+</aside>
+
+<main class="main">
+  <header class="topbar">
+    <div class="breadcrumbs">EXPLORE <span>/</span> <strong id="crumb">NATIONAL POKÉDEX</strong></div>
+    <div class="topactions">
+      <button id="paletteButton" class="iconbtn palette-btn" title="Search everything (Ctrl+K)" aria-label="Search everything">⌘ <span>Search</span></button>
+      <button id="shinyButton" class="iconbtn" title="Toggle shiny artwork" aria-label="Toggle shiny artwork" aria-pressed="false">✦</button>
+      <button id="themeButton" class="iconbtn" title="Toggle theme" aria-label="Toggle theme">☀</button>
+      <button id="randomButton" class="random-btn" title="Explore a random Pokémon">✦ <span>Surprise me</span></button>
+    </div>
+  </header>
+
+  <div class="content">
+
+    <section class="hero" id="hero">
+      <div class="hero-copy">
+        <div class="eyebrow"><span class="pulse"></span> YOUR POKÉMON UNIVERSE, EXPLORED</div>
+        <h1>Gotta know <em>'em all.</em></h1>
+        <p>Every species. Every evolution. Every matchup. Your beautifully organized guide to the world of Pokémon.</p>
+        <div class="hero-stats">
+          <div><strong id="totalStat">—</strong><span>SPECIES</span></div>
+          <div><strong id="heroCaught">0</strong><span>CAUGHT</span></div>
+          <div><strong id="heroPct">0%</strong><span>COMPLETE</span></div>
+        </div>
+      </div>
+      <div class="hero-art" aria-hidden="true">
+        <div class="orbit orbit1"></div>
+        <div class="orbit orbit2"></div>
+        <div class="orbball"><div class="balltop"></div><div class="ballline"></div><div class="ballbutton"></div></div>
+        <span class="spark s1">✧</span><span class="spark s2">✦</span><span class="spark s3">✧</span>
+      </div>
+    </section>
+
+    <section class="panel-view" id="panel" hidden></section>
+
+    <section class="list-section" id="listSection">
+      <div class="section-row">
+        <div>
+          <div class="kicker">THE COLLECTION</div>
+          <h2 id="heading">National Pokédex <span class="heading-count" id="resultCount">—</span></h2>
+        </div>
+        <button class="textbtn" id="clearFilters">Clear filters ↗</button>
+      </div>
+
+      <div class="filterbar">
+        <label class="search">
+          <span aria-hidden="true">⌕</span>
+          <input id="searchInput" type="search" placeholder="Search by name or Pokédex #" autocomplete="off" aria-label="Search Pokémon">
+          <kbd>/</kbd>
+        </label>
+        <select id="typeFilter" aria-label="Filter by type"><option value="">All types</option></select>
+        <select id="genFilter" aria-label="Filter by generation"><option value="">All generations</option></select>
+        <select id="sortFilter" aria-label="Sort Pokémon">
+          <option value="id-asc"># Number: low to high</option>
+          <option value="id-desc"># Number: high to low</option>
+          <option value="name-asc">Name: A to Z</option>
+          <option value="name-desc">Name: Z to A</option>
+          <option value="bst-desc">Stat total: high to low</option>
+          <option value="bst-asc">Stat total: low to high</option>
+        </select>
+      </div>
+
+      <div class="chipbar">
+        <button class="chip" data-chip="caught">◉ Caught only</button>
+        <button class="chip" data-chip="uncaught">○ Still missing</button>
+        <button class="chip" data-chip="legendary">★ Legendary &amp; Mythical</button>
+      </div>
+
+      <div class="filterinfo">
+        <span id="status">Fetching the Pokédex…</span>
+        <span class="legend"><i></i> TAP A CARD TO EXPLORE</span>
+      </div>
+
+      <div class="pokemon-grid" id="grid" aria-live="polite"></div>
+      <div class="loadMoreWrap"><button id="loadMore" class="loadmore" hidden>Load more Pokémon ↓</button></div>
+    </section>
+
+    <footer>ATLASDEX <span>Made for trainers, by fans. Data provided by <a href="https://pokeapi.co/" target="_blank" rel="noopener">PokéAPI</a>. Pokémon © Nintendo / Game Freak / Creatures.</span></footer>
+  </div>
+</main>
+
+<div id="teamDock" class="team-dock" hidden>
+  <div class="dock-label">TEAM</div>
+  <div class="dock-slots" id="dockSlots"></div>
+  <a class="dock-go" href="#/team">Analyze ↗</a>
+</div>
+
+<div id="palette" class="palette" hidden>
+  <div class="palette-box" role="dialog" aria-modal="true" aria-label="Command palette">
+    <div class="palette-top">
+      <span aria-hidden="true">⌘</span>
+      <input id="paletteInput" type="text" placeholder="Search Pokémon, moves, abilities, items or jump to a tool…" aria-label="Search everything">
+      <kbd>esc</kbd>
+    </div>
+    <div id="paletteResults" class="palette-results"></div>
+  </div>
+</div>
+
+<div id="overlay" class="overlay" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="Pokémon details" id="detailModal">
+    <button class="modalclose" id="closeModal" aria-label="Close details">✕</button>
+    <div id="modalContent"></div>
+  </div>
+</div>
+
+<input type="file" id="importFile" accept="application/json,.json" hidden>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+</div>
+<script src="./app.js" defer></script>
+</body>
+</html>
