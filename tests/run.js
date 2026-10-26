@@ -30,8 +30,10 @@ for (const f of files) {
   let ok = true;
   const reasons = [];
   try {
+    /* A suite that takes 20 s on an idle machine once needed over 5 minutes
+       under heavy load, so the ceiling only stops a real hang. */
     out = execFileSync(process.execPath, [path.join(__dirname, f)], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 600000
     });
   } catch (err) {
     ok = false;

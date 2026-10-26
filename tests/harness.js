@@ -4,8 +4,10 @@
 /* Poll until cond() is truthy or the time is up. Resolves to the final truthiness
    instead of throwing, so the assertion that follows reports what failed. Used
    where a fixed sleep used to gate an assertion: it returns as soon as the app
-   is ready, and waits up to timeoutMs when the machine is slow. */
-async function waitFor(cond, timeoutMs = 10000, intervalMs = 15) {
+   is ready, and waits up to timeoutMs when the machine is slow. The default is
+   generous because a heavily loaded machine once took over 10 s to boot a
+   window; a passing condition still returns on the next poll. */
+async function waitFor(cond, timeoutMs = 30000, intervalMs = 15) {
   const end = Date.now() + timeoutMs;
   for (;;) {
     let v = false;
