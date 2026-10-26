@@ -370,8 +370,20 @@ function cleanIds(list, max) {
   return out;
 }
 
-/* A held item is free text in the editor; keep only what a real item name uses. */
-const cleanItem = v => (typeof v === 'string' ? v.slice(0, 40).replace(/[^a-z0-9 -]/gi, '') : '');
+/* A held item is free text in the editor; keep only what a real item name uses
+   ("King's Rock", "Never-Melt Ice"). Markup characters never appear in one, so
+   text containing them is not an item at all and is dropped whole rather than
+   stripped into harmless-looking leftovers. */
+const cleanItem = v => (typeof v !== 'string' || /[<>"`=&\\]/.test(v)
+  ? '' : v.replace(/[^a-z0-9 '.-]/gi, '').slice(0, 40));
+
+/* Older versions clamped these inputs but never truncated them, so a saved
+   build can hold 12.5 where 12 was meant: truncate first, then range-check. */
+const clampInt = (v, lo, hi, fallback) => {
+  const n = typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : NaN;
+  return n >= lo && n <= hi ? n : fallback;
+};
+const slugOrNull = v => (typeof v === 'string' && SLUG.test(v) ? v : null);
 
 function sanitizeMember(raw) {
   const m = normalizeMember(raw);
@@ -381,21 +393,22 @@ function sanitizeMember(raw) {
 
   const spread = (src, fallback, max) => {
     const out = {};
-    for (const k of STAT_KEYS) { const v = own(src, k); out[k] = inRange(v, 0, max) ? v : fallback; }
+    for (const k of STAT_KEYS) out[k] = clampInt(own(src, k), 0, max, fallback);
     return out;
   };
   const moves = [];
   for (const n of asList(own(m, 'moves')).slice(0, LIMITS.scan)) {
-    if (typeof n === 'string' && SLUG.test(n) && !moves.includes(n)) moves.push(n);
+    const slug = slugOrNull(n);
+    if (slug && !moves.includes(slug)) moves.push(slug);
     if (moves.length === 4) break;
   }
-  const level = own(m, 'level'), nature = own(m, 'nature'), ability = own(m, 'ability'), item = own(m, 'item');
+  const nature = slugOrNull(own(m, 'nature'));
   return {
     id,
-    level: inRange(level, 1, 100) ? level : 50,
-    nature: typeof nature === 'string' && hasOwn(NATURES, nature) ? nature : 'hardy',
-    ability: typeof ability === 'string' && SLUG.test(ability) ? ability : null,
-    item: typeof item === 'string' && item.length <= 40 && /^[a-z0-9 -]*$/i.test(item) ? item : '',
+    level: clampInt(own(m, 'level'), 1, 100, 50),
+    nature: nature && hasOwn(NATURES, nature) ? nature : 'hardy',
+    ability: slugOrNull(own(m, 'ability')),
+    item: cleanItem(own(m, 'item')),
     ivs: spread(own(m, 'ivs'), 31, 31),
     evs: spread(own(m, 'evs'), 0, EV_STAT_MAX),
     moves
@@ -453,6 +466,9 @@ function sanitizeLoadedState() {
   if (stored('atlasdex:favorites')) store('atlasdex:favorites', [...state.favorites]);
   if (stored('atlasdex:caught'))    store('atlasdex:caught', [...state.caught]);
   if (stored('atlasdex:teams') || stored('atlasdex:team')) saveTeams();
+  /* The single-team key predates multi-team saves. Its members now live in
+     atlasdex:teams, so the old copy is dropped rather than left holding junk. */
+  if (stored('atlasdex:team')) { try { localStorage.removeItem('atlasdex:team'); } catch {} }
   if (stored('atlasdex:compare'))   store('atlasdex:compare', state.compare);
   if (stored('atlasdex:theme'))     store('atlasdex:theme', state.theme);
   if (stored('atlasdex:shiny'))     store('atlasdex:shiny', state.shiny);
@@ -528,15 +544,25 @@ function speciesIdOf(pokeId) {
   const sid = d?.species?.url ? idOf(d.species.url) : 0;
   return sid || pokeId;
 }
+/* Caught ids are kept as stored (a backup can name species this API version
+   does not list yet), but only ids in the species list count towards
+   progress, so completion can never pass 100%. */
+function caughtTotal() {
+  if (!state.list.length) return state.caught.size;
+  let n = 0;
+  for (const id of state.caught) if (id <= state.list.length) n++;
+  return n;
+}
 function syncCounts() {
+  const caught = caughtTotal();
   $('favCount').textContent = state.favorites.size;
   $('compareCount').textContent = state.compare.length;
   $('teamCount').textContent = state.team.length;
-  $('caughtCount').textContent = state.caught.size;
+  $('caughtCount').textContent = caught;
   $('streakCount').textContent = state.gameStats.streak || 0;
   const total = state.list.length || 1;
-  $('heroCaught').textContent = state.caught.size.toLocaleString();
-  $('heroPct').textContent = Math.round(state.caught.size / total * 100) + '%';
+  $('heroCaught').textContent = caught.toLocaleString();
+  $('heroPct').textContent = Math.round(caught / total * 100) + '%';
   renderDock();
 }
 
@@ -724,7 +750,12 @@ async function addToTeam(id) {
   /* Only a newly added member needs data. Removing one (a failed placeholder
      included) must not trigger another request. */
   if (added && !state.details.has(id)) {
-    try { state.details.set(id, await get(`${API}/pokemon/${id}`)); } catch { state.teamFailed.add(id); }
+    /* Marked as loading so a Team Builder render meanwhile waits for this
+       request instead of starting a second one. */
+    state.teamLoading.add(id);
+    try { state.details.set(id, await get(`${API}/pokemon/${id}`)); }
+    catch { state.teamFailed.add(id); }
+    finally { state.teamLoading.delete(id); }
   }
   syncCounts();
   if (state.mode === 'team') renderTeam();
@@ -1348,7 +1379,7 @@ function renderProgress() {
   syncCounts();
 
   const total = state.list.length;
-  const done = state.caught.size;
+  const done = caughtTotal();
   const pct = total ? (done / total * 100) : 0;
 
   const gens = Array.from({ length: 9 }, (_, i) => {
@@ -1462,7 +1493,7 @@ function paintMemberEditor() {
         ${learnable.map(n => `<option value="${safe(n)}" ${n === chosen ? 'selected' : ''}>${safe(title(n))}</option>`).join('')}
       </select>
       <span class="ms-meta">${mv
-        ? `${typeBadge(mv.type.name)}<small>${DMG_CLASS[mv.damage_class?.name] || ''} ${safe(mv.power || '—')} pow · ${mv.accuracy ? safe(mv.accuracy) + '%' : '—'}</small>`
+        ? `${typeBadge(mv.type.name)}<small>${safe(dmgIcon(mv.damage_class?.name))} ${safe(mv.power || '—')} pow · ${mv.accuracy ? safe(mv.accuracy) + '%' : '—'}</small>`
         : '<small>No move selected</small>'}</span>
     </div>`;
   }).join('');
@@ -1994,6 +2025,9 @@ const KINDS = {
 };
 
 const DMG_CLASS = { physical: '●', special: '◆', status: '○' };
+/* Own keys only: a class name from the API must never resolve to something
+   inherited from Object.prototype. */
+function dmgIcon(name) { return hasOwn(DMG_CLASS, name) ? DMG_CLASS[name] : ''; }
 
 async function loadIndex(kind) {
   if (state.indexes[kind]) return state.indexes[kind];
@@ -2047,7 +2081,7 @@ function browseRow(kind, r) {
     return `<button class="dexrow" data-entity="move:${safe(r.name)}">
       <span class="dx-name">${safe(title(r.name))}</span>
       <span class="dx-type">${d ? typeBadge(d.type.name) : '<i class="dx-wait"></i>'}</span>
-      <span class="dx-cls">${d ? safe((DMG_CLASS[d.damage_class?.name] || '') + ' ' + title(d.damage_class?.name || '')) : ''}</span>
+      <span class="dx-cls">${d ? safe(dmgIcon(d.damage_class?.name) + ' ' + title(d.damage_class?.name || '')) : ''}</span>
       <span class="dx-num">${d ? safe(d.power ?? '—') : ''}</span>
       <span class="dx-num">${d ? (d.accuracy ? safe(d.accuracy) + '%' : '—') : ''}</span>
       <span class="dx-num">${d ? safe(d.pp ?? '—') : ''}</span>
