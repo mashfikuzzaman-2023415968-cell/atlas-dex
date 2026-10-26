@@ -143,6 +143,8 @@ const importObj = (env, obj) => importText(env, JSON.stringify(obj));
 
 /* What a view may contain: no inline script, no event handler other than art()'s
    own onerror, no autofocus/srcdoc, numeric ids in data-* actions, known image sources. */
+/* The game's silhouette has a second fixed shape: a constant, name-free SVG data URI. */
+const MYSTERY_HANDLER = /^this\.onerror=function\(\)\{this\.onerror=null;this\.src='data:image\/svg\+xml,[A-Za-z0-9%_.~!*()-]*'\};this\.src='https:\/\/raw\.githubusercontent\.com\/PokeAPI\/sprites\/master\/sprites\/pokemon\/(shiny\/)?\d+\.png'$/;
 const ART_HANDLER = /^this\.onerror=null;this\.src='https:\/\/raw\.githubusercontent\.com\/PokeAPI\/sprites\/master\/sprites\/pokemon\/(shiny\/)?\d+\.png'$/;
 const ART_SRC = /^https:\/\/raw\.githubusercontent\.com\/PokeAPI\/sprites\/master\/sprites\/pokemon\/(other\/official-artwork\/)?(shiny\/)?\d+\.png$/;
 const NUMERIC_DATA = ['data-open', 'data-team', 'data-edit', 'data-catch', 'data-fav', 'data-compare', 'data-cry', 'data-form', 'data-guess', 'data-retry', 'data-gen', 'data-teamsel'];
@@ -152,7 +154,7 @@ function audit(env) {
     if (el.tagName === 'SCRIPT' && !el.getAttribute('src')) bad.push('inline <script>');
     for (const a of el.attributes) {
       const n = a.name.toLowerCase();
-      if (n.startsWith('on') && !(el.tagName === 'IMG' && n === 'onerror' && ART_HANDLER.test(a.value))) bad.push(`${el.tagName} ${n}="${a.value.slice(0, 60)}"`);
+      if (n.startsWith('on') && !(el.tagName === 'IMG' && n === 'onerror' && (ART_HANDLER.test(a.value) || MYSTERY_HANDLER.test(a.value)))) bad.push(`${el.tagName} ${n}="${a.value.slice(0, 60)}"`);
       if (n === 'autofocus' || n === 'srcdoc' || n === 'formaction') bad.push(`${el.tagName} ${n}`);
       if (NUMERIC_DATA.includes(n) && !/^\d+$/.test(a.value)) bad.push(`${n}="${a.value.slice(0, 60)}"`);
     }
