@@ -230,7 +230,9 @@ const state = {
   dl: { running: false, done: 0, total: 0, stop: false },
   items: new Map(),
   indexes: { move: null, ability: null, item: null },
-  browse: { kind: 'move', search: '', filter: '', sort: '', shown: 48, loadedAll: {} },
+  /* Filter and sort are kept per dex kind: a type chosen on Moves must not leak
+     onto Items, whose own dropdown would then read "All" while hiding every row. */
+  browse: { kind: 'move', search: '', filters: {}, sorts: {}, shown: 48, loadedAll: {} },
   entity: null,
   editing: null,
   calcTab: 'stats',
@@ -242,6 +244,8 @@ const state = {
     cRate: 45, cBall: 'Poké Ball', cStatus: 'None', cHp: 100, cMaxHp: 100,
     eggGroup: 'monster'
   },
+  calcMon: null,     // /pokemon id picked in the Stats calculator (null = follow the default)
+  lastForm: null,    // /pokemon id last shown in the detail modal, the calculator's default
   palette: { open: false, q: '', sel: 0 },
   game: null,
   gameStats: read('atlasdex:game', { streak: 0, best: 0, lastDaily: null, lastScore: null }),
@@ -695,7 +699,9 @@ function breedingPanel(d, s) {
   const evs = d.stats.filter(x => x.effort > 0)
     .map(x => `${x.effort} ${STAT_LABEL[x.stat.name] || title(x.stat.name)}`).join(', ') || 'None';
   const steps = s.hatch_counter != null ? ((s.hatch_counter + 1) * 255).toLocaleString() + ' steps' : '—';
-  const catchPct = s.capture_rate != null ? (s.capture_rate / 255 * 100).toFixed(1) + '% at full HP' : '—';
+  /* Same formula as the Catch Rate calculator (full HP, Poké Ball, no status), so the two agree. */
+  const catchPct = s.capture_rate != null
+    ? (catchChance(100, 100, s.capture_rate, 1, 1) * 100).toFixed(1) + '% at full HP' : '—';
 
   const fact = (label, value) => `<div class="fact"><small>${label}</small><strong>${value}</strong></div>`;
 
@@ -795,6 +801,7 @@ function showTab() {
   const d = state.details.get(fid);
   if (!d || !s) return;
   state.formId = fid;
+  state.lastForm = fid;   // the Stats calculator's default Pokémon
 
   const types = d.types.map(t => t.type.name);
   const desc = s.flavor_text_entries?.find(x => x.language.name === 'en')?.flavor_text
@@ -827,14 +834,6 @@ function showTab() {
       </div>`;
   } else if (state.tab === 'stats') {
     const c = state.calc;
-    const realRows = d.stats.map(st => {
-      const n2 = st.stat.name;
-      const v = realStat(st.base_stat, c.iv, c.ev, c.level, n2, c.nature);
-      const mod = natureMod(c.nature, n2);
-      return `<div class="statrow"><span>${safe(STAT_LABEL[n2] || title(n2))}
-          ${mod > 1 ? '<i class="up">▲</i>' : mod < 1 ? '<i class="down">▼</i>' : ''}</span>
-        <b>${v}</b><div class="bar"><div style="width:${Math.min(100, v / 714 * 100)}%"></div></div></div>`;
-    }).join('');
     body = `<h3 class="paneltitle">Base statistics · Total ${total}</h3>${statRows(d)}
       <h3 class="paneltitle" style="margin-top:26px">Actual stats</h3>
       <div class="fieldgrid">
@@ -843,7 +842,7 @@ function showTab() {
         ${num('iv', 'IV', c.iv, 0, 31)}
         ${num('ev', 'EV', c.ev, 0, 252, 4)}
       </div>
-      ${realRows}
+      <div id="actualStats">${actualStatRows(d)}</div>
       <p class="dex-desc">Calculated with the Gen 3+ formula. The arrows mark the stats this nature raises and lowers.</p>`;
   } else if (state.tab === 'matchups') {
     body = matchupPanel(types);
@@ -1833,16 +1832,17 @@ function browseFiltered(kind) {
   if (b.search) rows = rows.filter(r => r.name.includes(b.search));
 
   const cache = cacheFor(kind);
-  if (b.filter) {
+  const filter = b.filters[kind] || '';
+  if (filter) {
     rows = rows.filter(r => {
       const d = cache.get(r.name);
       if (!d) return false;
-      if (kind === 'move') return d.type?.name === b.filter || d.damage_class?.name === b.filter;
-      if (kind === 'item') return d.category?.name === b.filter;
+      if (kind === 'move') return d.type?.name === filter || d.damage_class?.name === filter;
+      if (kind === 'item') return d.category?.name === filter;
       return true;
     });
   }
-  if (kind === 'move' && b.sort === 'power') {
+  if (kind === 'move' && b.sorts[kind] === 'power') {
     rows = [...rows].sort((x, y) => (cache.get(y.name)?.power || 0) - (cache.get(x.name)?.power || 0));
   }
   return rows;
@@ -1875,6 +1875,20 @@ function browseRow(kind, r) {
   </button>`;
 }
 
+/* Item categories only exist on records already fetched, so the dropdown grows
+   as rows hydrate. The active choice is always listed, even if its records
+   are not cached yet, so the control can never disagree with the filter. */
+function itemCategories(selected) {
+  const cats = new Set([...state.items.values()].map(d => d.category?.name).filter(Boolean));
+  if (selected) cats.add(selected);
+  return [...cats].sort();
+}
+const itemFilterOptions = (cats, selected) => `<option value="">All categories</option>`
+  + cats.map(c => `<option value="${safe(c)}" ${selected === c ? 'selected' : ''}>${safe(title(c))}</option>`).join('');
+
+/* Renders the view's shell once: the search box and filter controls live here
+   and are never replaced by typing, filtering or row hydration (CLAUDE.md 3.7).
+   Everything that changes with the data goes through paintBrowseResults(). */
 async function renderBrowse(kind) {
   showList(false);
   state.browse.kind = kind;
@@ -1892,23 +1906,42 @@ async function renderBrowse(kind) {
   }
 
   const b = state.browse;
-  const rows = browseFiltered(kind);
-  const page = rows.slice(0, b.shown);
-  const loadedAll = state.browse.loadedAll[kind];
+  const filter = b.filters[kind] || '', sort = b.sorts[kind] || '';
+  const cats = kind === 'item' ? itemCategories(filter) : [];
 
   const filters = kind === 'move'
     ? `<select id="brFilter"><option value="">All types &amp; classes</option>
-        <optgroup label="Type">${TYPES.map(t => `<option value="${t}" ${b.filter === t ? 'selected' : ''}>${title(t)}</option>`).join('')}</optgroup>
-        <optgroup label="Category">${['physical','special','status'].map(c => `<option value="${c}" ${b.filter === c ? 'selected' : ''}>${title(c)}</option>`).join('')}</optgroup>
+        <optgroup label="Type">${TYPES.map(t => `<option value="${t}" ${filter === t ? 'selected' : ''}>${title(t)}</option>`).join('')}</optgroup>
+        <optgroup label="Category">${['physical','special','status'].map(c => `<option value="${c}" ${filter === c ? 'selected' : ''}>${title(c)}</option>`).join('')}</optgroup>
        </select>
        <select id="brSort"><option value="">Sort: A to Z</option>
-        <option value="power" ${b.sort === 'power' ? 'selected' : ''}>Sort: highest power</option></select>`
+        <option value="power" ${sort === 'power' ? 'selected' : ''}>Sort: highest power</option></select>`
     : kind === 'item'
-    ? `<select id="brFilter"><option value="">All categories</option>
-        ${[...new Set([...state.items.values()].map(d => d.category?.name).filter(Boolean))].sort()
-          .map(c => `<option value="${c}" ${b.filter === c ? 'selected' : ''}>${title(c)}</option>`).join('')}
-       </select>`
+    ? `<select id="brFilter" data-cats="${safe(cats.join(','))}">${itemFilterOptions(cats, filter)}</select>`
     : '';
+
+  $('panel').innerHTML = `
+    <div class="kicker">REFERENCE</div>
+    <h2 class="panel-title">${KINDS[kind].label} <span class="heading-count" id="brCount"></span></h2>
+    <div class="filterbar browse">
+      <label class="search"><span aria-hidden="true">⌕</span>
+        <input id="brSearch" type="search" placeholder="Search ${KINDS[kind].label.toLowerCase()}" value="${safe(b.search)}"></label>
+      ${filters}
+    </div>
+    <div id="brResults"></div>`;
+
+  paintBrowseResults(kind);
+}
+
+/* The computed region: count, load-all banner, table and load-more. Safe to call
+   at any time; it does nothing once the user has left the view. */
+function paintBrowseResults(kind) {
+  const box = $('brResults');
+  if (!box || state.mode !== kind || state.browse.kind !== kind) return;
+  const b = state.browse;
+  const rows = browseFiltered(kind);
+  const page = rows.slice(0, b.shown);
+  const loadedAll = b.loadedAll[kind];
 
   const head = kind === 'move'
     ? `<div class="dexrow dexhead"><span>Move</span><span>Type</span><span>Category</span><span>Power</span><span>Acc</span><span>PP</span></div>`
@@ -1916,14 +1949,22 @@ async function renderBrowse(kind) {
     ? `<div class="dexrow item dexhead"><span></span><span>Item</span><span>Category</span><span>Cost</span></div>`
     : `<div class="dexrow ability dexhead"><span>Ability</span><span>Effect</span></div>`;
 
-  $('panel').innerHTML = `
-    <div class="kicker">REFERENCE</div>
-    <h2 class="panel-title">${KINDS[kind].label} <span class="heading-count">${rows.length.toLocaleString()}</span></h2>
-    <div class="filterbar browse">
-      <label class="search"><span aria-hidden="true">⌕</span>
-        <input id="brSearch" type="search" placeholder="Search ${KINDS[kind].label.toLowerCase()}" value="${safe(b.search)}"></label>
-      ${filters}
-    </div>
+  const count = $('brCount');
+  if (count) count.textContent = rows.length.toLocaleString();
+
+  /* Only rebuild the category options when a new category has appeared, so an
+     open dropdown is not closed under the user's hand. */
+  const dd = $('brFilter');
+  if (kind === 'item' && dd) {
+    const filter = b.filters[kind] || '';
+    const cats = itemCategories(filter);
+    if (dd.dataset.cats !== cats.join(',')) {
+      dd.innerHTML = itemFilterOptions(cats, filter);
+      dd.dataset.cats = cats.join(',');
+    }
+  }
+
+  box.innerHTML = `
     ${(kind !== 'ability' && !loadedAll) ? `<div class="loadall">
       <span>Filtering and sorting need the full dataset. Rows fill in as you scroll.</span>
       <button class="chip" data-loadall="${kind}">Load all ${KINDS[kind].label.toLowerCase()} data</button></div>` : ''}
@@ -1942,22 +1983,22 @@ async function hydrateBrowse(kind, names) {
   await pool(pending, 6, async name => {
     cache.set(name, await get(`${API}/${KINDS[kind].endpoint}/${name}`));
   });
-  if (token === state.request && state.mode === kind) renderBrowse(kind);
+  if (token === state.request && state.mode === kind) paintBrowseResults(kind);
 }
 
 async function loadAllOf(kind) {
   const idx = state.indexes[kind] || [];
   const cache = cacheFor(kind);
   const pending = idx.filter(r => !cache.has(r.name)).map(r => r.name);
-  if (!pending.length) { state.browse.loadedAll[kind] = true; renderBrowse(kind); return; }
+  if (!pending.length) { state.browse.loadedAll[kind] = true; paintBrowseResults(kind); return; }
   toast(`Loading ${pending.length.toLocaleString()} records — this runs in the background`);
   let done = 0;
   await pool(pending, 8, async name => {
     cache.set(name, await get(`${API}/${KINDS[kind].endpoint}/${name}`));
-    if (++done % 100 === 0 && state.mode === kind) renderBrowse(kind);
+    if (++done % 100 === 0 && state.mode === kind) paintBrowseResults(kind);
   });
   state.browse.loadedAll[kind] = true;
-  if (state.mode === kind) renderBrowse(kind);
+  if (state.mode === kind) paintBrowseResults(kind);
   toast('All data loaded and cached');
 }
 
@@ -2052,7 +2093,22 @@ const BALLS = {
   'Poké Ball':1, 'Great Ball':1.5, 'Ultra Ball':2, 'Dusk Ball':3,
   'Quick Ball':5, 'Net Ball':3.5, 'Timer Ball':4, 'Master Ball':255
 };
+/* The stored keys and multipliers stay as they are; only the labels explain when a
+   conditional ball really reaches its multiplier (the calculator assumes it does). */
+const BALL_NOTES = {
+  'Dusk Ball': '3x at night or in caves', 'Quick Ball': '5x on the first turn only',
+  'Net Ball': '3.5x vs Water or Bug', 'Timer Ball': 'up to 4x after 10+ turns'
+};
+const ballLabel = b => BALL_NOTES[b] ? `${b} (${BALL_NOTES[b]})` : b;
 const STATUSES = { None:1, 'Burn / Poison / Paralysis':1.5, 'Sleep / Freeze':2.5 };
+
+/* Smallest and largest value each calculator number may hold. Clearing a field must
+   never write 0 into state (Number('') is 0), so every write goes through clampCalc(). */
+const CALC_LIMITS = {
+  level: [1, 100], iv: [0, 31], ev: [0, 252],
+  dLevel: [1, 100], dPower: [0, 250], dAtk: [1, 999], dDef: [1, 999], dHp: [1, 999],
+  cRate: [3, 255], cMaxHp: [1, 999], cHp: [1, 999]
+};
 
 function natureMod(nature, statName) {
   const [up, down] = NATURES[nature] || [null, null];
@@ -2071,16 +2127,35 @@ function realStat(base, iv, ev, level, statName, nature) {
   return Math.floor((core + 5) * natureMod(nature, statName));
 }
 
-/* Gen 5+ damage formula, returning the 85–100% roll spread. */
+/* The games round a modifier .5 down, not up: pokeRound(v, m) is v * m / 4096
+   rounded half-down, computed in integers (m is the modifier in 4096ths). */
+const pokeRound = (v, m) => Math.floor((v * m + 2047) / 4096);
+
+/* Gen 6+ damage formula (the current games), applied in the games' own order so
+   each step floors or rounds where they do: base, critical, random roll, STAB,
+   type effectiveness one factor at a time, burn, then any other modifier.
+   Returns the minimum (85%) and maximum (100%) rolls plus all 16 rolls. */
 function damageRange(opts) {
   const { level, power, atk, def, stab, typeMult, crit, burn, other } = opts;
-  if (!power || typeMult === 0) return { min: 0, max: 0 };
-  const base = Math.floor(Math.floor(Math.floor(2 * level / 5 + 2) * power * atk / def) / 50) + 2;
-  const mods = (crit ? 1.5 : 1) * (stab ? 1.5 : 1) * typeMult * (burn ? 0.5 : 1) * (other || 1);
-  return {
-    min: Math.max(typeMult > 0 ? 1 : 0, Math.floor(base * 0.85 * mods)),
-    max: Math.max(typeMult > 0 ? 1 : 0, Math.floor(base * 1.00 * mods))
-  };
+  const zero = { min: 0, max: 0, rolls: new Array(16).fill(0) };
+  if (!power || !(typeMult > 0)) return zero;
+  const base = Math.floor(Math.floor(Math.floor(2 * level / 5 + 2) * power * atk / Math.max(1, def)) / 50) + 2;
+  const afterCrit = crit ? pokeRound(base, 6144) : base;     // 1.5x since Gen 6
+  const rolls = [];
+  for (let roll = 85; roll <= 100; roll++) {
+    let x = Math.floor(afterCrit * roll / 100);
+    if (stab) x = pokeRound(x, 6144);
+    /* Effectiveness is a chain of single steps: each 2x doubles, each 0.5x halves
+       and floors. 4x and 0.25x are therefore two steps, not one multiplication. */
+    let m = typeMult;
+    while (m >= 2) { x *= 2; m /= 2; }
+    while (m <= 0.5) { x = Math.floor(x / 2); m *= 2; }
+    if (m !== 1) x = Math.floor(x * m);                      // not a power of two: best effort
+    if (burn) x = pokeRound(x, 2048);
+    if (other && other !== 1) x = pokeRound(x, Math.round(other * 4096));
+    rolls.push(Math.max(1, x));                              // a hit that is not immune always deals 1
+  }
+  return { min: rolls[0], max: rolls[15], rolls };
 }
 
 /* Gen 5+ capture probability, including the four shake checks. */
@@ -2099,36 +2174,107 @@ function catchChance(maxHp, currentHp, captureRate, ballMult, statusMult) {
 const num = (id, label, val, min, max, step) =>
   `<label class="field"><small>${label}</small>
     <input type="number" data-calc="${id}" value="${val}" min="${min}" max="${max}" step="${step || 1}"></label>`;
-const sel = (id, label, val, opts) =>
+const sel = (id, label, val, opts, fmt) =>
   `<label class="field"><small>${label}</small><select data-calc="${id}">
-    ${opts.map(o => `<option value="${safe(o)}" ${String(o) === String(val) ? 'selected' : ''}>${safe(title(String(o)))}</option>`).join('')}
+    ${opts.map(o => `<option value="${safe(o)}" ${String(o) === String(val) ? 'selected' : ''}>${safe(fmt ? fmt(o) : title(String(o)))}</option>`).join('')}
   </select></label>`;
 const chk = (id, label, val) =>
   `<label class="field check"><input type="checkbox" data-calc="${id}" ${val ? 'checked' : ''}><small>${label}</small></label>`;
 
-function statsCalcPanel() {
+/* The Pokémon the Stats calculator works on: an explicit pick, else whatever the
+   detail modal last showed, else the first team member. */
+function calcMonId() {
+  return state.calcMon || state.lastForm || state.team[0]?.id || null;
+}
+
+/* Rows of "actual stats" for one /pokemon payload, shared by the calculator tab and
+   the modal's Stats tab so both can repaint just this region while typing. */
+function actualStatRows(d) {
   const c = state.calc;
-  const mon = state.details.get(state.calcMon) || null;
-  const rows = (mon?.stats || []).map(s => {
-    const name = s.stat.name;
-    const value = realStat(s.base_stat, c.iv, c.ev, c.level, name, c.nature);
+  return d.stats.map(st => {
+    const name = st.stat.name;
+    const value = realStat(st.base_stat, c.iv, c.ev, c.level, name, c.nature);
     const mod = natureMod(c.nature, name);
     return `<div class="statrow"><span>${safe(STAT_LABEL[name] || title(name))}
         ${mod > 1 ? '<i class="up">▲</i>' : mod < 1 ? '<i class="down">▼</i>' : ''}</span>
       <b>${value}</b>
       <div class="bar"><div style="width:${Math.min(100, value / 714 * 100)}%"></div></div></div>`;
   }).join('');
+}
+
+let calcMonFailed = null;   // /pokemon id whose details could not be fetched
+
+function statsCalcResult() {
+  const c = state.calc;
+  const id = calcMonId();
+  if (!id) {
+    return `<div class="empty"><strong>No Pokémon chosen yet</strong>
+      Search for one above${state.team.length ? ' or tap a team member' : ''}.</div>`;
+  }
+  const mon = state.details.get(id);
+  if (!mon) {
+    return calcMonFailed === id
+      ? `<div class="empty"><strong>Could not load ${safe(title(pokeName(id)))}</strong>Check your connection and pick it again.</div>`
+      : `<div class="empty">Loading base stats…</div>`;
+  }
+  return `<h3 class="paneltitle">${safe(title(mon.name))} at level ${c.level}</h3>${actualStatRows(mon)}`;
+}
+
+/* Fetch the chosen Pokémon through the cache-first get(), then repaint the result. */
+async function loadCalcMon() {
+  const id = calcMonId();
+  if (!id || state.details.has(id)) return;
+  try { state.details.set(id, await get(`${API}/pokemon/${id}`)); calcMonFailed = null; }
+  catch { calcMonFailed = id; }
+  syncCalcMonInput();
+  if (calcMonId() === id && state.mode === 'calc' && state.calcTab === 'stats') paintCalcResult();
+}
+
+/* Keeps the picker's text in step with the chosen Pokémon without ever touching
+   it while the user is typing in it. */
+function syncCalcMonInput() {
+  const input = $('calcMonInput'), id = calcMonId();
+  if (!input || !id || document.activeElement === input) return;
+  input.value = title(pokeName(id));
+}
+
+function selectCalcMon(pokeId) {
+  state.calcMon = pokeId;
+  calcMonFailed = null;
+  document.querySelectorAll('[data-calcmon]').forEach(b =>
+    b.classList.toggle('on', Number(b.dataset.calcmon) === pokeId));
+  syncCalcMonInput();
+  paintCalcResult();
+  loadCalcMon();
+}
+
+/* What a user typed into the picker, matched against the species names. */
+function speciesFromInput(text) {
+  const key = String(text || '').trim().toLowerCase().replace(/[\s_]+/g, '-');
+  return key ? state.list.find(p => p.name === key) || null : null;
+}
+
+function statsCalcPanel() {
+  const c = state.calc;
+  const id = calcMonId();
+  const chips = state.team.map(m => `<button class="chip ${m.id === id ? 'on' : ''}" data-calcmon="${m.id}">${safe(title(pokeName(m.id)))}</button>`).join('');
 
   return `<p class="dex-desc">Converts base stats into real in-game stats using the Gen 3+ formula.
-    Pick a Pokémon from any card with the ⬢ team button, or open one and use its Stats tab for a prefilled version.</p>
+    Choose a Pokémon below or tap a team member. Opening a Pokémon and its Stats tab also selects it here.</p>
+    <div class="monpicker">
+      <label class="field"><small>POKÉMON</small>
+        <input type="text" id="calcMonInput" list="calcMonList" autocomplete="off" spellcheck="false"
+          placeholder="Search a Pokémon…" value="${id ? safe(title(pokeName(id))) : ''}"></label>
+      <datalist id="calcMonList">${state.list.map(p => `<option value="${safe(title(p.name))}">`).join('')}</datalist>
+      ${chips ? `<div class="chipbar monchips" role="group" aria-label="Your team">${chips}</div>` : ''}
+    </div>
     <div class="fieldgrid">
       ${num('level', 'LEVEL', c.level, 1, 100)}
       ${sel('nature', 'NATURE', c.nature, Object.keys(NATURES))}
       ${num('iv', 'IV (0–31)', c.iv, 0, 31)}
       ${num('ev', 'EV (0–252)', c.ev, 0, 252, 4)}
     </div>
-    ${mon ? `<h3 class="paneltitle">${safe(title(mon.name))} at level ${c.level}</h3>${rows}`
-      : `<div class="empty">Open any Pokémon and use its <strong>Stats</strong> tab to calculate with real base stats.</div>`}
+    <div id="calcResult">${statsCalcResult()}</div>
     <p class="dex-desc">Nature arrows mark the raised and lowered stat. 31 IVs and 252 EVs is the competitive maximum
     for a single stat, with 510 EVs total across all six.</p>`;
 }
@@ -2214,9 +2360,9 @@ function teamDamagePanel() {
     </div>`;
 }
 
-function damageCalcPanel() {
+function damageCalcResult() {
   const c = state.calc;
-  const { min, max } = damageRange({
+  const { min, max, rolls } = damageRange({
     level: c.dLevel, power: c.dPower, atk: c.dAtk, def: c.dDef,
     stab: c.dStab, typeMult: Number(c.dType), crit: c.dCrit, burn: c.dBurn
   });
@@ -2225,8 +2371,18 @@ function damageCalcPanel() {
   const hits = max > 0 ? Math.ceil(c.dHp / max) : '∞';
   const koText = max >= c.dHp ? 'Guaranteed one-hit KO at maximum roll.'
     : `Roughly a ${hits}-hit KO at best rolls.`;
+  return `<div class="result-card ${pctMax >= 100 ? 'm-weak' : pctMax >= 50 ? 'm-neutral' : 'm-resist'}">
+      <small>DAMAGE RANGE</small>
+      <strong>${min} – ${max}</strong>
+      <p>${pctMin.toFixed(1)}% – ${pctMax.toFixed(1)}% of the defender's HP. ${koText}</p>
+    </div>
+    <p class="dex-desc rolls">All 16 rolls: ${rolls.join(', ')}</p>`;
+}
 
-  return `<p class="dex-desc">The Gen 5+ damage formula including the 85–100% random roll.
+function damageCalcPanel() {
+  const c = state.calc;
+  return `<p class="dex-desc">The Gen 6+ damage formula (the current games), rounding in the games' own order,
+    including the 85–100% random roll.
     Use the Stats calculator or a Pokémon's Stats tab to get real attack and defence numbers.</p>
     <div class="fieldgrid">
       ${num('dLevel', 'ATTACKER LEVEL', c.dLevel, 1, 100)}
@@ -2241,33 +2397,36 @@ function damageCalcPanel() {
       ${chk('dCrit', 'Critical hit', c.dCrit)}
       ${chk('dBurn', 'Attacker burned (physical)', c.dBurn)}
     </div>
-    <div class="result-card ${pctMax >= 100 ? 'm-weak' : pctMax >= 50 ? 'm-neutral' : 'm-resist'}">
-      <small>DAMAGE RANGE</small>
-      <strong>${min} – ${max}</strong>
-      <p>${pctMin.toFixed(1)}% – ${pctMax.toFixed(1)}% of the defender's HP. ${koText}</p>
+    <div id="calcResult">${damageCalcResult()}</div>`;
+}
+
+function catchCalcResult() {
+  const c = state.calc;
+  const hp = Math.min(Math.max(1, c.cHp), c.cMaxHp);   // current HP can never exceed max HP
+  const p = catchChance(c.cMaxHp, hp, c.cRate, BALLS[c.cBall] || 1, STATUSES[c.cStatus] || 1);
+  const pct = p * 100;
+  const expected = p > 0 ? Math.ceil(1 / p) : '∞';
+  return `<div class="result-card ${pct >= 50 ? 'm-resist' : pct >= 15 ? 'm-neutral' : 'm-weak'}">
+      <small>CATCH CHANCE PER BALL</small>
+      <strong>${pct.toFixed(1)}%</strong>
+      <p>Expect about ${expected} ball${expected === 1 ? '' : 's'} on average.
+      ${hp / c.cMaxHp > 0.5 ? 'Lowering its HP further would help a lot.' : 'HP is already low enough to matter.'}
+      ${BALL_NOTES[c.cBall] ? `Assumes the ball's condition is met (${safe(BALL_NOTES[c.cBall])}).` : ''}</p>
     </div>`;
 }
 
 function catchCalcPanel() {
   const c = state.calc;
-  const p = catchChance(c.cMaxHp, Math.max(1, c.cHp), c.cRate, BALLS[c.cBall] || 1, STATUSES[c.cStatus] || 1);
-  const pct = p * 100;
-  const expected = p > 0 ? Math.ceil(1 / p) : '∞';
   return `<p class="dex-desc">Gen 5+ capture formula, including all four shake checks.
     A species' capture rate is shown on its Breeding tab.</p>
     <div class="fieldgrid">
       ${num('cRate', 'CAPTURE RATE (3–255)', c.cRate, 3, 255)}
       ${num('cMaxHp', 'MAX HP', c.cMaxHp, 1, 999)}
-      ${num('cHp', 'CURRENT HP', c.cHp, 1, 999)}
-      ${sel('cBall', 'BALL', c.cBall, Object.keys(BALLS))}
+      ${num('cHp', 'CURRENT HP', c.cHp, 1, c.cMaxHp)}
+      ${sel('cBall', 'BALL', c.cBall, Object.keys(BALLS), ballLabel)}
       ${sel('cStatus', 'STATUS', c.cStatus, Object.keys(STATUSES))}
     </div>
-    <div class="result-card ${pct >= 50 ? 'm-resist' : pct >= 15 ? 'm-neutral' : 'm-weak'}">
-      <small>CATCH CHANCE PER BALL</small>
-      <strong>${pct.toFixed(1)}%</strong>
-      <p>Expect about ${expected} ball${expected === 1 ? '' : 's'} on average.
-      ${c.cHp / c.cMaxHp > 0.5 ? 'Lowering its HP further would help a lot.' : 'HP is already low enough to matter.'}</p>
-    </div>`;
+    <div id="calcResult">${catchCalcResult()}</div>`;
 }
 
 async function breedingCalcPanel() {
@@ -2299,6 +2458,34 @@ function naturesPanel() {
     </div>`;
 }
 
+/* The synchronous tabs' markup. Breeding fills itself in after an async fetch. */
+function calcBodyHtml() {
+  return state.calcTab === 'stats' ? statsCalcPanel()
+    : state.calcTab === 'team-damage' ? teamDamagePanel()
+    : state.calcTab === 'damage' ? damageCalcPanel()
+    : state.calcTab === 'catch' ? catchCalcPanel()
+    : state.calcTab === 'natures' ? naturesPanel()
+    : '<div class="empty">Loading…</div>';
+}
+
+/* Repaints only the result area of the open calculator tab, so the inputs, and the
+   caret in whichever one is being typed in, are never replaced. False if this tab
+   has no separate result area. */
+function paintCalcResult() {
+  const box = $('calcResult');
+  if (!box) return false;
+  box.innerHTML = state.calcTab === 'stats' ? statsCalcResult()
+    : state.calcTab === 'damage' ? damageCalcResult()
+    : state.calcTab === 'catch' ? catchCalcResult() : '';
+  return true;
+}
+
+/* The modal's Stats tab: only the "Actual stats" rows change while typing. */
+function paintActualStats() {
+  const box = $('actualStats'), d = state.details.get(state.formId);
+  if (box && d) box.innerHTML = actualStatRows(d);
+}
+
 async function renderCalculators() {
   showList(false);
   $('crumb').textContent = 'CALCULATORS';
@@ -2306,19 +2493,14 @@ async function renderCalculators() {
 
   const tabs = [['stats','Stats'],['team-damage','Team Damage'],['damage','Damage (manual)'],
     ['catch','Catch Rate'],['breeding','Breeding'],['natures','Natures']];
-  const body = state.calcTab === 'stats' ? statsCalcPanel()
-    : state.calcTab === 'team-damage' ? teamDamagePanel()
-    : state.calcTab === 'damage' ? damageCalcPanel()
-    : state.calcTab === 'catch' ? catchCalcPanel()
-    : state.calcTab === 'natures' ? naturesPanel()
-    : '<div class="empty">Loading…</div>';
 
   $('panel').innerHTML = `<div class="kicker">TOOLS</div>
     <h2 class="panel-title">Calculators</h2>
     <div class="detail-tabs">${tabs.map(([k, l]) =>
       `<button data-calctab="${k}" class="${state.calcTab === k ? 'selected' : ''}">${l}</button>`).join('')}</div>
-    <div id="calcBody">${body}</div>`;
+    <div id="calcBody">${calcBodyHtml()}</div>`;
 
+  if (state.calcTab === 'stats') loadCalcMon();
   if (state.calcTab === 'breeding') {
     const html = await breedingCalcPanel();
     if (state.mode === 'calc' && state.calcTab === 'breeding') $('calcBody').innerHTML = html;
@@ -2524,6 +2706,8 @@ function route() {
 
   if (state.modalId || state.entity || !$('overlay').hidden) closeModal();
 
+  /* Search and paging restart on every visit; filter and sort live per kind in
+     state.browse.filters / sorts and are deliberately kept. */
   if (hash === '#/moves')     { state.mode = 'move';    state.browse = { ...state.browse, search: '', shown: 48 }; renderBrowse('move'); return; }
   if (hash === '#/abilities') { state.mode = 'ability'; state.browse = { ...state.browse, search: '', shown: 48 }; renderBrowse('ability'); return; }
   if (hash === '#/items')     { state.mode = 'item';    state.browse = { ...state.browse, search: '', shown: 48 }; renderBrowse('item'); return; }
@@ -2628,39 +2812,99 @@ $('overlay').addEventListener('click', e => { if (e.target === $('overlay')) clo
 $('palette').addEventListener('click', e => { if (e.target === $('palette')) closePalette(); });
 $('paletteButton').addEventListener('click', openPalette);
 
-/* Delegated input handling for dynamically rendered controls. */
+/* A calculator control's new value into state. Number fields are clamped, and an
+   empty or unparsable value is ignored (returns false), so a half-typed field never
+   writes 0 into state. */
+function setCalcField(el) {
+  const key = el.dataset.calc;
+  if (el.type === 'checkbox') { state.calc[key] = el.checked; return true; }
+  if (el.type !== 'number') { state.calc[key] = el.value; return true; }
+  const v = clampCalc(key, el.value);
+  if (v == null) return false;
+  state.calc[key] = v;
+  if (key === 'cMaxHp') state.calc.cHp = Math.min(state.calc.cHp, v);   // current HP follows a lowered max
+  return true;
+}
+
+/* The clamped integer for a calculator number field, or null for empty/invalid text. */
+function clampCalc(key, raw) {
+  const lim = CALC_LIMITS[key];
+  if (!lim || String(raw).trim() === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  const max = key === 'cHp' ? Math.min(lim[1], state.calc.cMaxHp) : lim[1];
+  return Math.max(lim[0], Math.min(max, Math.round(n)));
+}
+
+/* Brings the calculator's output in line with state. The modal's Stats tab and the
+   Calculators view share state.calc, and the modal can be open over either, so the
+   control's own container decides what to repaint. Only computed regions change,
+   never the control being used (CLAUDE.md 3.7). */
+function refreshCalc(el) {
+  if (el.closest('#modalContent')) { paintActualStats(); return; }
+  if (state.mode !== 'calc') return;
+  if (paintCalcResult()) return;
+  if (state.calcTab === 'breeding') { renderCalculators(); return; }
+  /* Tabs without a result region (Team Damage) repaint their body, then hand focus
+     back to the same control so keyboard users are not dropped. */
+  const key = el.dataset.calc;
+  $('calcBody').innerHTML = calcBodyHtml();
+  document.querySelector(`[data-calc="${CSS.escape(key)}"]`)?.focus();
+}
+
+/* Show the clamped state value in every number field of the control's container. */
+function normaliseCalcInputs(el) {
+  const root = el.closest('#modalContent') || $('panel');
+  root.querySelectorAll('input[type="number"][data-calc]').forEach(i => {
+    const key = i.dataset.calc, v = state.calc[key];
+    if (key === 'cHp') i.max = state.calc.cMaxHp;   // current HP can never exceed max HP
+    if (v != null && String(v) !== i.value) i.value = v;
+  });
+}
+
+/* Delegated input handling for dynamically rendered controls. Selects and
+   checkboxes fire both input and change in browsers, so they are handled on
+   change only; number and text fields are handled here as the user types. */
 document.addEventListener('input', e => {
   const t = e.target;
   if (t.id === 'paletteInput') { state.palette.q = t.value; state.palette.sel = 0; paintPalette(); return; }
+  if (t.tagName === 'SELECT' || t.type === 'checkbox') return;
   if (t.id === 'brSearch') {
     state.browse.search = t.value.trim().toLowerCase();
     state.browse.shown = 48;
     clearTimeout(state.browseTimer);
-    state.browseTimer = setTimeout(() => renderBrowse(state.browse.kind), 180);
+    state.browseTimer = setTimeout(() => paintBrowseResults(state.browse.kind), 180);
+    return;
+  }
+  if (t.id === 'calcMonInput') {
+    const hit = speciesFromInput(t.value);
+    if (hit) selectCalcMon(hit.id);
     return;
   }
   if (state.editing != null && handleLoadoutEdit(t)) return;
 
   const calc = t.closest('[data-calc]');
-  if (calc) {
-    const key = calc.dataset.calc;
-    state.calc[key] = calc.type === 'checkbox' ? calc.checked
-      : calc.type === 'number' ? Number(calc.value) : calc.value;
-    /* The modal wins: it can be open over any view, including the calculators. */
-    if (state.modalId) showTab(); else if (state.mode === 'calc') renderCalculators();
-  }
+  if (calc && setCalcField(calc)) refreshCalc(calc);
 });
 document.addEventListener('change', e => {
   const t = e.target;
   if (state.editing != null && handleLoadoutEdit(t)) return;
-  if (t.id === 'brFilter') { state.browse.filter = t.value; state.browse.shown = 48; renderBrowse(state.browse.kind); return; }
-  if (t.id === 'brSort')   { state.browse.sort = t.value; renderBrowse(state.browse.kind); return; }
+  const kind = state.browse.kind;
+  if (t.id === 'brFilter') { state.browse.filters[kind] = t.value; state.browse.shown = 48; paintBrowseResults(kind); return; }
+  if (t.id === 'brSort')   { state.browse.sorts[kind] = t.value; paintBrowseResults(kind); return; }
   if (t.id === 'importFile' && t.files?.[0]) { importData(t.files[0]); t.value = ''; return; }
+  if (t.id === 'calcMonInput') {
+    /* Leaving the picker on something that is not a species restores the chosen one. */
+    const hit = speciesFromInput(t.value);
+    if (hit) selectCalcMon(hit.id);
+    else { const cur = calcMonId(); t.value = cur ? title(pokeName(cur)) : ''; }
+    return;
+  }
   const calc = t.closest('[data-calc]');
-  if (calc && (calc.tagName === 'SELECT' || calc.type === 'checkbox')) {
-    state.calc[calc.dataset.calc] = calc.type === 'checkbox' ? calc.checked : calc.value;
-    /* The modal wins: it can be open over any view, including the calculators. */
-    if (state.modalId) showTab(); else if (state.mode === 'calc') renderCalculators();
+  if (calc) {
+    setCalcField(calc);
+    normaliseCalcInputs(calc);
+    refreshCalc(calc);
   }
 });
 
@@ -2729,10 +2973,11 @@ document.addEventListener('click', e => {
   if (ent) { const [k, ...r] = ent.dataset.entity.split(':'); openEntity(k, r.join(':')); return; }
   const byName = hit('[data-openname]'); if (byName) { openByName(byName.dataset.openname); return; }
 
-  if (hit('[data-browsemore]')) { state.browse.shown += 48; renderBrowse(state.browse.kind); return; }
+  if (hit('[data-browsemore]')) { state.browse.shown += 48; paintBrowseResults(state.browse.kind); return; }
   const la = hit('[data-loadall]'); if (la) { loadAllOf(la.dataset.loadall); return; }
 
   const ctab = hit('[data-calctab]'); if (ctab) { state.calcTab = ctab.dataset.calctab; renderCalculators(); return; }
+  const cmon = hit('[data-calcmon]'); if (cmon) { selectCalcMon(Number(cmon.dataset.calcmon)); return; }
 
   const tsel = hit('[data-teamsel]');
   if (tsel) { state.activeTeam = Number(tsel.dataset.teamsel); saveTeams(); renderTeam(); return; }
