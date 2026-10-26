@@ -816,6 +816,12 @@ const EXPECTED_GAME = { streak: 0, best: 0, lastDaily: null, lastScore: null, la
       await sleep(200);
       const m = e.stored('atlasdex:teams')[0].members[0];
       eq('editor ignores a nature, an IV key and a move that fail the rules', [m.nature, Object.keys(m.ivs).sort(), m.moves], ['hardy', Object.keys(blank(0)).sort(), []]);
+      const itemBox = e.d.querySelector('[data-ld="item"]');
+      itemBox.value = 'Life Orb<';
+      itemBox.dispatchEvent(new e.w.Event('input', { bubbles: true }));
+      await sleep(50);
+      eq('typing a markup character strips just that character, and the box shows what is saved',
+        [e.stored('atlasdex:teams')[0].members[0].item, itemBox.value], ['Life Orb', 'Life Orb']);
     }
 
     // openPokemon itself refuses ids that are not whole, listed species numbers

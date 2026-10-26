@@ -43,8 +43,9 @@ class MResponse {
     this.status = init.status ?? 200;
     this.type = init.type || 'basic';
     this.ok = init.ok ?? (this.status >= 200 && this.status < 300);
+    this.redirected = !!init.redirected;
   }
-  clone() { return new MResponse(this.body, { status: this.status, type: this.type, ok: this.ok }); }
+  clone() { return new MResponse(this.body, { status: this.status, type: this.type, ok: this.ok, redirected: this.redirected }); }
   static error() { return new MResponse(null, { status: 0, type: 'error', ok: false }); }
 }
 const opaque = () => new MResponse(null, { status: 0, type: 'opaque', ok: false });
@@ -545,8 +546,9 @@ async function artworkTests() {
 /* ------------------------------------------------------------------ */
 
 const optionsOf = c => [...c.d.querySelectorAll('.guessbtn')].map(b => b.textContent.trim()).join(',');
-async function playOut(c, picks = () => 0) {
-  /* Answer all five questions; returns the options shown for each. */
+async function playOut(c, picks = () => 0, before = () => {}) {
+  /* Answer all five questions; returns the options shown for each. before(i)
+     runs just before question i is answered (used to move the clock). */
   if (!c.d.querySelector('[data-game="daily"]')) { await c.go('#/game'); await wait(20); }
   c.click(c.d.querySelector('[data-game="daily"]'));
   await waitFor(() => c.d.querySelector('.silhouette'));
@@ -554,6 +556,7 @@ async function playOut(c, picks = () => 0) {
   for (let i = 0; i < 5; i++) {
     await waitFor(() => c.d.querySelectorAll('.guessbtn').length === 4);
     shown.push(optionsOf(c));
+    before(i);
     c.click(c.d.querySelectorAll('.guessbtn')[picks(i)]);
     await waitFor(() => c.d.querySelector('[data-gamenext]'));
     c.click(c.d.querySelector('[data-gamenext]'));
@@ -614,7 +617,8 @@ async function dateTests() {
   ok('a replay leaves the streak and score alone', stats(t).streak === 5 && stats(t).lastScore === 3);
   await t.close();
 
-  const g = await boot({ now: at('2026-03-10T19:00:00Z'), ls: { 'atlasdex:game': { streak: 7, best: 7, lastDaily: '2026-03-09', lastScore: 5 } } });
+  /* localDates marks stats recorded since dates became local, so no grace day applies. */
+  const g = await boot({ now: at('2026-03-10T19:00:00Z'), ls: { 'atlasdex:game': { streak: 7, best: 7, lastDaily: '2026-03-09', lastScore: 5, localDates: true } } });
   await playOut(g);
   ok('a lastDaily older than yesterday resets the streak to 1 and keeps the best', stats(g).streak === 1 && stats(g).best === 7);
   await g.close();
@@ -761,8 +765,123 @@ async function resumeTests() {
   }
 }
 
+/* Follow-ups from the independent review of batch 3. */
+async function reviewFollowUps() {
+  console.log('\n--- SERVICE WORKER: review follow-ups ---');
+  {
+    const sw = makeSW();
+    sw.sandbox.fetchImpl = async req => new MResponse('body-for:' + req.url);
+    await sw.fetchEv(BASE + 'app.js?v=1');
+    await sw.fetchEv(BASE + 'app.js?v=2');
+    const keys = [...sw.cacheMap(sw.read('SHELL_CACHE')).keys()];
+    ok('query strings share one shell entry keyed by path', keys.length === 1 && keys[0] === BASE + 'app.js');
+    sw.sandbox.fetchImpl = async () => { throw new TypeError('offline'); };
+    ok('and that entry answers the same path with any query offline', (await sw.fetchEv(BASE + 'app.js?v=3')).res.body === 'body-for:' + BASE + 'app.js?v=2');
+  }
+  {
+    const sw = makeSW();
+    sw.sandbox.fetchImpl = async () => new MResponse('moved', { redirected: true });
+    const r = await sw.fetchEv(BASE + 'old-path/', { mode: 'navigate' });
+    ok('a redirected response is passed through', r.res.body === 'moved');
+    ok('but never stored, since it cannot answer a navigation later', !sw.cacheMap(sw.read('SHELL_CACHE')).has(BASE + 'old-path/'));
+  }
+  {
+    const sw = makeSW();
+    sw.sandbox.caches.open = async () => { throw new Error('QuotaExceededError'); };
+    sw.sandbox.fetchImpl = async req => new MResponse('net:' + req.url, { type: 'cors' });
+    const art = await sw.fetchEv('https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/25.png');
+    ok('when storage fails, artwork still comes from the network', art.res && art.res.body.startsWith('net:'));
+    const shell = await sw.fetchEv(BASE + 'app.js');
+    ok('and so does the app shell', shell.res && shell.res.body === 'net:' + BASE + 'app.js');
+  }
+  {
+    const sw = makeSW();
+    const js = BASE + 'app.js';
+    sw.store.set(sw.read('SHELL_CACHE'), new Map([[js, new MResponse('old-app')]]));
+    sw.sandbox.fetchImpl = () => new Promise(res => setTimeout(() => res(new MResponse('new-app')), 40));
+    const r = await sw.fetchEv(js);   // resolves only once every waitUntil promise has settled
+    ok('a network slower than the timeout is answered from the cache', r.res.body === 'old-app');
+    ok('the worker is kept alive (waitUntil) until the late response refreshes the cache', sw.cacheMap(sw.read('SHELL_CACHE')).get(js).body === 'new-app');
+  }
+
+  console.log('\n--- DAILY DATES: review follow-ups ---');
+  process.env.TZ = 'Asia/Dhaka';
+  const DHAKA_28_10AM = at('2026-10-28T04:00:00Z');
+  {
+    /* Played at 02:00 Dhaka on 27 Oct under the old UTC keys, so 26 Oct was stored. */
+    const c = await boot({ now: DHAKA_28_10AM, ls: { 'atlasdex:game': { streak: 5, best: 5, lastDaily: '2026-10-26', lastScore: 3 } } });
+    await playOut(c);
+    const st = stats(c);
+    ok('a pre-local-date lastDaily one extra day back keeps the streak once (5 -> 6)', st.streak === 6 && st.lastDaily === '2026-10-28' && st.localDates === true);
+    await c.close();
+  }
+  {
+    const c = await boot({ now: DHAKA_28_10AM, ls: { 'atlasdex:game': { streak: 5, best: 5, lastDaily: '2026-10-26', lastScore: 3, localDates: true } } });
+    await playOut(c);
+    ok('after the first local-date finish the grace day is gone (streak resets)', stats(c).streak === 1 && stats(c).best === 5);
+    await c.close();
+  }
+  {
+    const c = await boot({ now: DHAKA_28_10AM, ls: { 'atlasdex:game': { streak: 5, best: 5, lastDaily: '2026-10-25', lastScore: 3 } } });
+    await playOut(c);
+    ok('the grace is one day only: three days back still resets', stats(c).streak === 1);
+    await c.close();
+  }
+  {
+    /* Dealt at 23:59 on 27 Oct, finished at 00:01 on the 28th. */
+    const c = await boot({ now: at('2026-10-27T17:59:00Z'), ls: { 'atlasdex:game': { streak: 3, best: 3, lastDaily: '2026-10-26', lastScore: 2, localDates: true } } });
+    await playOut(c, () => 0, i => { if (i === 4) c.w.__now = at('2026-10-27T18:01:00Z'); });
+    const st = stats(c);
+    ok('a daily finished after midnight is credited to the day it was dealt', st.lastDaily === '2026-10-27' && st.streak === 4);
+    c.click(c.d.querySelector('[data-share]'));
+    await waitFor(() => c.copied);
+    ok('and its share text shows that day', c.copied.includes('2026-10-27') && !c.copied.includes('2026-10-28'));
+    c.click(c.d.querySelector('[data-gamemenu]')); await wait(20);
+    ok("the new day's puzzle is still there to play", /Play today's challenge/.test(c.$('panel').innerHTML));
+    await c.close();
+  }
+  {
+    const c = await boot({ now: at('2026-10-27T17:59:00Z'), ls: { 'atlasdex:game': { streak: 3, best: 3, lastDaily: '2026-10-27', lastScore: 2, localDates: true } } });
+    await playOut(c, () => 3, i => { if (i === 4) c.w.__now = at('2026-10-27T18:01:00Z'); });
+    ok('a replay that runs past midnight still does not count', stats(c).streak === 3 && stats(c).lastDaily === '2026-10-27' && stats(c).lastScore === 2);
+    await c.close();
+  }
+
+  console.log('\n--- DAILY RESUME: review follow-ups ---');
+  const NOW = at('2026-05-05T08:00:00Z');
+  const key = 'atlasdex:daily';
+  {
+    /* 20000 passes the structural check (a species id) but is not an option here. */
+    const c = await boot({ now: NOW, ls: { [key]: { date: '2026-05-05', results: [true], q: 0, picked: 20000 } } });
+    await c.go('#/game');
+    const menu = c.$('panel').innerHTML;
+    ok('a saved pick that is not an option is not offered as a resume', /Play today's challenge/.test(menu) && !/Resume/.test(menu));
+    ok('and the stale progress is cleared', c.w.localStorage.getItem(key) === null);
+    c.click(c.d.querySelector('[data-game="daily"]'));
+    await waitFor(() => c.d.querySelector('.silhouette'));
+    ok('the game starts at question 1', /Question 1 of 5/.test(c.$('panel').innerHTML));
+    await c.close();
+  }
+  {
+    const probe = await boot({ now: NOW });
+    await probe.go('#/game');
+    probe.click(probe.d.querySelector('[data-game="daily"]'));
+    await waitFor(() => probe.d.querySelectorAll('.guessbtn').length === 4);
+    const optionId = Number(probe.d.querySelector('.guessbtn').dataset.guess);
+    await probe.close();
+    /* Yesterday's progress whose pick happens to be one of today's options: only the date can reject it. */
+    const c = await boot({ now: NOW, ls: { [key]: { date: '2026-05-04', results: [true], q: 0, picked: optionId } } });
+    await c.go('#/game');
+    ok("yesterday's progress is not offered as a resume", !/Resume/.test(c.$('panel').innerHTML));
+    c.click(c.d.querySelector('[data-game="daily"]'));
+    await waitFor(() => c.d.querySelector('.silhouette'));
+    ok('and the game starts fresh at question 1', /Question 1 of 5/.test(c.$('panel').innerHTML) && !c.d.querySelector('.reveal-row'));
+    await c.close();
+  }
+}
+
 (async () => {
-  for (const section of [serviceWorkerTests, offlineTests, artworkTests, dateTests, silhouetteTests, resumeTests]) {
+  for (const section of [serviceWorkerTests, offlineTests, artworkTests, dateTests, silhouetteTests, resumeTests, reviewFollowUps]) {
     try { await section(); } catch (e) { ok(`${section.name} crashed: ${e && e.stack || e}`, false); }
   }
 

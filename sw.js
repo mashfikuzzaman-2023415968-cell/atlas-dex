@@ -41,15 +41,19 @@ async function trimArt(cache) {
 }
 
 async function artResponse(e) {
-  const cache = await caches.open(ART_CACHE);
-  const hit = await cache.match(e.request);
-  if (hit) return hit;
+  /* Storage can fail (quota, private mode); artwork then simply comes from the network. */
+  let cache = null;
+  try {
+    cache = await caches.open(ART_CACHE);
+    const hit = await cache.match(e.request);
+    if (hit) return hit;
+  } catch { cache = null; }
   try {
     const res = await fetch(e.request);
     /* Only verifiable successes are kept. An opaque response has status 0, so a
        404 or a broken image would be replayed forever, and Chrome bills each
        opaque entry as several MB of quota. */
-    if (res.ok && res.type !== 'opaque') {
+    if (cache && res.ok && res.type !== 'opaque') {
       const clone = res.clone();
       const insert = ++artInserts;
       e.waitUntil(cache.put(e.request, clone)
@@ -64,16 +68,25 @@ async function artResponse(e) {
 
 /* Network first so a deploy reaches visitors without anyone remembering to
    bump SHELL_CACHE; the cache is the offline and slow-network fallback. */
+/* Shell entries are keyed by path alone: a query string never selects a
+   different file, and keying by it would let the cache grow without bound. */
+const shellKey = req => { const u = new URL(req.url); return u.origin + u.pathname; };
+
 async function shellResponse(e) {
   const req = e.request;
-  const cache = await caches.open(SHELL_CACHE);
+  const key = shellKey(req);
+  let cache = null;
+  try { cache = await caches.open(SHELL_CACHE); } catch { cache = null; }
 
   const net = fetch(req).then(res => {
-    if (res.ok) cache.put(req, res.clone()).catch(() => {});
+    /* A redirected response cannot later answer a navigation, so it is never stored. */
+    if (cache && res.ok && !res.redirected) cache.put(key, res.clone()).catch(() => {});
     return res;
   });
   /* Let a slow fetch finish in the background so the cache still refreshes. */
   e.waitUntil(net.catch(() => {}));
+  /* Without storage there is nothing to fall back on: just wait for the network. */
+  if (!cache) { try { return await net; } catch { return Response.error(); } }
 
   let timer;
   const slow = new Promise(resolve => { timer = setTimeout(() => resolve(null), NET_TIMEOUT); });
@@ -83,8 +96,11 @@ async function shellResponse(e) {
   } catch { /* offline: fall through to the cache */ }
   finally { clearTimeout(timer); }
 
-  const hit = await cache.match(req)
-    || (req.mode === 'navigate' && ((await cache.match('./')) || (await cache.match('./index.html'))));
+  let hit = null;
+  try {
+    hit = await cache.match(key)
+      || (req.mode === 'navigate' && ((await cache.match('./')) || (await cache.match('./index.html'))));
+  } catch { hit = null; }
   if (hit) return hit;
   /* Nothing cached: a slow network is still better than an error. */
   try { return await net; } catch { return Response.error(); }

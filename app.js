@@ -461,7 +461,10 @@ function sanitizeGame(raw) {
     lastDaily: typeof daily === 'string' && DATE_KEY.test(daily) ? daily : null,
     lastScore: inRange(score, 0, ROUND) ? score : null,
     lastGrid: typeof grid === 'string'
-      ? Array.from(grid).filter(c => c === '🟩' || c === '🟥').slice(0, ROUND).join('') : ''
+      ? Array.from(grid).filter(c => c === '🟩' || c === '🟥').slice(0, ROUND).join('') : '',
+    /* Marks stats whose lastDaily is a local date (see finishGame). Absent on
+       stats saved before local dates, which is what grants their grace day. */
+    ...(own(raw, 'localDates') === true ? { localDates: true } : {})
   };
 }
 
@@ -1709,7 +1712,18 @@ function handleLoadoutEdit(t) {
     /* Same rules the boot-time sanitiser applies, so nothing saved here is
        blanked or rewritten on the next load. */
     if (ld === 'level')        m.level = Math.max(1, Math.min(100, Math.trunc(Number(t.value)) || 1));
-    else if (ld === 'item')    m.item = cleanItem(t.value);
+    else if (ld === 'item') {
+      /* While typing, a disallowed character is stripped rather than blanking
+         the whole item (cleanItem's rule for stored data), and the box is
+         corrected so it always shows exactly what is saved. */
+      const clean = t.value.replace(/[^a-z0-9 '.-]/gi, '').slice(0, 40);
+      if (clean !== t.value) {
+        const pos = Math.max(0, (t.selectionStart ?? clean.length) - (t.value.length - clean.length));
+        t.value = clean;
+        try { t.setSelectionRange(pos, pos); } catch {}
+      }
+      m.item = clean;
+    }
     else if (ld === 'nature')  { if (hasOwn(NATURES, t.value)) m.nature = t.value; }
     else if (ld === 'ability') m.ability = SLUG.test(t.value) ? t.value : null;
     else return false;
@@ -1981,7 +1995,13 @@ const dayKey = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '
 const todayKey = () => dayKey(new Date());
 /* setDate steps back one calendar day; subtracting 86 400 000 ms is an hour
    out on a daylight-saving changeover day. */
-const yesterdayKey = () => { const d = new Date(); d.setDate(d.getDate() - 1); return dayKey(d); };
+const dayBefore = key => {
+  const [y, m, d] = key.split('-').map(Number);
+  const date = new Date(y, m - 1, d);
+  date.setDate(date.getDate() - 1);
+  return dayKey(date);
+};
+const yesterdayKey = () => dayBefore(todayKey());
 
 /* In-progress daily, so quitting and restarting cannot replay questions whose
    answers were already seen. Shape: { date, results: [bool], q, picked }. */
@@ -1998,11 +2018,21 @@ function sanitizeDaily(raw) {
     && (results.length === q) === (picked === null);
   return valid ? { date, results: results.slice(), q, picked } : null;
 }
-function loadDaily() {
+function loadDaily(date = todayKey()) {
   const raw = read(DAILY_KEY, null);
   const d = sanitizeDaily(raw);
-  if (d && d.date === todayKey()) return d;
+  if (d && d.date === date) return d;
   if (raw !== null) clearDaily();
+  return null;
+}
+/* Saved progress is only resumable if its pick is one of that question's
+   options in the puzzle being dealt. The menu and startGame() both ask this,
+   so the menu never promises a resume that the game then refuses. */
+function resumableDaily(date, questions) {
+  const saved = loadDaily(date);
+  if (!saved) return null;
+  if (saved.picked === null || questions[saved.q]?.options.some(o => o.id === saved.picked)) return saved;
+  clearDaily();
   return null;
 }
 function saveDaily(g) {
@@ -2027,8 +2057,8 @@ function seedFrom(str) {
   return h >>> 0;
 }
 
-function buildQuestions(mode) {
-  const seed = mode === 'daily' ? seedFrom('atlasdex-' + todayKey()) : (Math.random() * 1e9) | 0;
+function buildQuestions(mode, date = todayKey()) {
+  const seed = mode === 'daily' ? seedFrom('atlasdex-' + date) : (Math.random() * 1e9) | 0;
   const rnd = mulberry32(seed);
 
   let pool = state.list;
@@ -2061,13 +2091,16 @@ function buildQuestions(mode) {
 }
 
 function startGame(mode) {
-  const g = { mode, q: 0, questions: buildQuestions(mode), results: [], revealed: false, picked: null };
+  /* The daily's date is fixed when it is dealt, so a game that runs past
+     midnight still belongs to the day whose puzzle it is. */
+  const date = todayKey();
+  const g = { mode, q: 0, questions: buildQuestions(mode, date), results: [], revealed: false, picked: null };
   if (mode === 'daily') {
-    g.date = todayKey();
+    g.date = date;
     /* A replay after finishing never counts, so it is not worth resuming. */
     g.replay = state.gameStats.lastDaily === g.date;
-    const saved = g.replay ? null : loadDaily();
-    if (saved && (saved.picked === null || g.questions[saved.q].options.some(o => o.id === saved.picked))) {
+    const saved = g.replay ? null : resumableDaily(g.date, g.questions);
+    if (saved) {
       g.results = saved.results.slice();
       g.q = saved.q;
       g.picked = saved.picked;
@@ -2105,14 +2138,21 @@ function finishGame() {
 
   if (g.mode === 'daily') {
     const st = state.gameStats;
-    const today = todayKey();
     clearDaily();
-    if (st.lastDaily !== today) {
-      st.streak = st.lastDaily === yesterdayKey() ? (st.streak || 0) + 1 : 1;
+    /* Recorded against the puzzle's own date, never for a replay, and lastDaily
+       never moves backwards (keys are YYYY-MM-DD, so string order is date order). */
+    if (!g.replay && !(st.lastDaily && st.lastDaily >= g.date)) {
+      const yesterday = dayBefore(g.date);
+      /* Stats saved before dates became local hold UTC dates, which can sit a
+         day behind the player's calendar east of UTC. Allow that one extra day
+         until the first local-date finish, so the switch never costs a streak. */
+      const continues = st.lastDaily === yesterday || (!st.localDates && st.lastDaily === dayBefore(yesterday));
+      st.streak = continues ? (st.streak || 0) + 1 : 1;
       st.best = Math.max(st.best || 0, st.streak);
-      st.lastDaily = today;
+      st.lastDaily = g.date;
       st.lastScore = score;
       st.lastGrid = g.results.map(r => r ? '🟩' : '🟥').join('');
+      st.localDates = true;
       store('atlasdex:game', st);
     }
   }
@@ -2123,7 +2163,7 @@ function shareResult() {
   const g = state.game;
   const grid = g.results.map(r => r ? '🟩' : '🟥').join('');
   const score = g.results.filter(Boolean).length;
-  const text = `AtlasDex — Who's That Pokémon?\n${g.mode === 'daily' ? todayKey() : 'Endless'}  ${grid}  ${score}/${ROUND}`
+  const text = `AtlasDex — Who's That Pokémon?\n${g.mode === 'daily' ? g.date : 'Endless'}  ${grid}  ${score}/${ROUND}`
     + (g.mode === 'daily' ? `\nStreak: ${state.gameStats.streak} 🔥` : '');
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(text).then(() => toast('Result copied to clipboard')).catch(() => toast('Could not copy'));
@@ -2138,7 +2178,8 @@ function renderGame() {
   syncCounts();
   const st = state.gameStats;
   const doneToday = st.lastDaily === todayKey();
-  const savedDaily = !doneToday && !state.game ? loadDaily() : null;
+  const savedDaily = !doneToday && !state.game && state.list.length
+    ? resumableDaily(todayKey(), buildQuestions('daily', todayKey())) : null;
   const header = `<div class="kicker">DAILY CHALLENGE</div>
     <h2 class="panel-title">Who's That Pokémon?</h2>
     <div class="game-stats">
