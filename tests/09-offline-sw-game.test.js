@@ -5,6 +5,7 @@
    fail on the code before the fix). */
 const fs = require('fs'), path = require('path'), vm = require('vm');
 const { JSDOM } = require('jsdom');
+const { waitFor, trackErrors, finish, crash } = require('./harness');
 const { IDBFactory, IDBKeyRange } = require('fake-indexeddb');
 
 const dir = process.env.ATLAS_DIR || path.resolve(__dirname, '..');
@@ -15,15 +16,6 @@ const swjs = fs.readFileSync(dir + '/sw.js', 'utf8');
 let fail = 0;
 const ok = (label, cond) => { console.log((cond ? '  PASS  ' : '  FAIL  ') + label); if (!cond) fail++; };
 const wait = ms => new Promise(r => setTimeout(r, ms));
-async function waitFor(cond, ms = 6000) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    try { if (cond()) return true; } catch {}
-    await wait(15);
-  }
-  try { return !!cond(); } catch { return false; }
-}
-
 /* A silent early exit (an awaited promise that never settles) must fail loudly. */
 let finished = false;
 process.on('exit', code => {
@@ -31,14 +23,15 @@ process.on('exit', code => {
 });
 
 /* Uncaught runtime errors anywhere are failures. */
-const runtimeErrors = [];
+const runtimeErrors = [], allErrs = [];
 const noteError = kind => e => {
   const msg = kind + ': ' + ((e && e.stack) || e);
   runtimeErrors.push(msg);
   console.log('  FAIL  ' + msg);
 };
 process.on('uncaughtException', noteError('uncaught'));
-process.on('unhandledRejection', noteError('unhandled'));
+/* Rejected promises and every window's page errors land in runtimeErrors too. */
+trackErrors({ addEventListener() {} }, runtimeErrors);
 
 /* ================================================================== */
 /* SERVICE WORKER, simulated                                           */
@@ -301,8 +294,8 @@ async function boot(o = {}) {
   c.$ = id => c.d.getElementById(id);
   c.click = el => el.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
   c.toast = () => c.$('toast').textContent;
-  c.errs = [];
-  w.addEventListener('error', e => c.errs.push(e.message));
+  c.errs = trackErrors(w);
+  allErrs.push(c.errs);
 
   w.fetch = async url => {
     c.fetchLog.push(url);
@@ -773,9 +766,6 @@ async function resumeTests() {
     try { await section(); } catch (e) { ok(`${section.name} crashed: ${e && e.stack || e}`, false); }
   }
 
-  console.log('\nruntime errors: ' + (runtimeErrors.length ? runtimeErrors.join(' | ') : 'none'));
-  if (runtimeErrors.length) fail++;
-  console.log(fail ? `\n${fail} FAILURES` : '\nAll tests passed');
   finished = true;
-  process.exit(fail ? 1 : 0);
-})();
+  finish(fail, [...runtimeErrors, ...allErrs.flat()], 'All tests passed');
+})().catch(crash);

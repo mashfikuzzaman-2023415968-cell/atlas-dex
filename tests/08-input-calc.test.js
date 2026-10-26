@@ -3,6 +3,7 @@
    breeding catch chance. Each assertion is tagged with its spec item. */
 const fs = require('fs'), path = require('path'), { JSDOM } = require('jsdom');
 const { IDBFactory, IDBKeyRange } = require('fake-indexeddb');
+const { waitFor, trackErrors, finish, crash } = require('./harness');
 const dir = path.resolve(__dirname, '..');
 const html = fs.readFileSync(dir + '/index.html', 'utf8');
 const appjs = fs.readFileSync(dir + '/app.js', 'utf8');
@@ -10,14 +11,10 @@ const appjs = fs.readFileSync(dir + '/app.js', 'utf8');
 let fail = 0;
 const ok = (label, cond) => { console.log((cond ? '  PASS  ' : '  FAIL  ') + label); if (!cond) fail++; };
 const wait = ms => new Promise(r => setTimeout(r, ms));
-/* Bounded polling instead of fixed sleeps. */
-async function waitFor(cond, timeoutMs = 4000) {
-  const end = Date.now() + timeoutMs;
-  while (Date.now() < end) { try { if (cond()) return true; } catch {} await wait(10); }
-  try { return !!cond(); } catch { return false; }
-}
 const errs = [];
-process.on('unhandledRejection', e => errs.push('unhandledRejection: ' + (e && e.message || e)));
+/* harness.js feeds rejected promises and page errors into errs; a dummy window
+   registers the shared array once. */
+trackErrors({ addEventListener() {} }, errs);
 process.on('uncaughtException', e => errs.push('uncaughtException: ' + (e && e.message || e)));
 
 /* ---- mock PokéAPI ---------------------------------------------------- */
@@ -92,7 +89,7 @@ function boot() {
   w.navigator.storage = { estimate: async () => ({ usage: 5e7, quota: 2e9 }), persist: async () => true };
   w.navigator.clipboard = { writeText: async () => {} };
   w.localStorage.clear();
-  w.addEventListener('error', e => errs.push(e.message));
+  trackErrors(w, errs);
   w.eval(appjs);
   const d = w.document, $ = id => d.getElementById(id);
   const ev = (el, type) => el.dispatchEvent(new w.Event(type, { bubbles: true }));
@@ -477,8 +474,5 @@ const hpAt = { 1: '12', 10: '35', 100: '261' }, atkAt = { 1: '7', 10: '31', 100:
   ok('[2.3] the picker has a .light override', /\.light \.monpicker/.test(v6));
   ok('[2.3] the picker has a max-width:700px rule', /@media\(max-width:700px\)\{[^]*\.monpicker/.test(v6));
 
-  console.log('\nruntime errors: ' + (errs.length ? errs.join(' | ') : 'none'));
-  if (errs.length) fail++;
-  console.log(fail ? `\n${fail} FAILURES` : '\nAll input/calculator tests passed');
-  process.exit(fail ? 1 : 0);
-})().catch(e => { console.log('  FAIL  suite crashed: ' + (e && e.stack || e)); process.exit(1); });
+  finish(fail, errs, 'All input/calculator tests passed');
+})().catch(crash);

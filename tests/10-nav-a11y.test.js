@@ -3,6 +3,8 @@
    fetch. Assertions are exact; waits poll for a condition instead of sleeping. */
 const fs = require('fs'), { JSDOM } = require('jsdom');
 const path = require('path');
+const { waitFor, trackErrors, finish, crash } = require('./harness');
+const allErrs = [];
 const dir = path.resolve(__dirname, '..');
 const html = fs.readFileSync(dir + '/index.html', 'utf8');
 const appjs = fs.readFileSync(dir + '/app.js', 'utf8');
@@ -88,8 +90,8 @@ async function boot(opts = {}) {
   if (opts.matchLight !== undefined) {
     w.matchMedia = q => ({ matches: opts.matchLight, media: q, addEventListener() {}, removeEventListener() {} });
   }
-  const errs = [];
-  w.addEventListener('error', e => errs.push(e.message));
+  const errs = trackErrors(w);
+  allErrs.push(errs);
   w.eval(appjs);
   const d = w.document;
   const app = { w, d, errs, $: id => d.getElementById(id) };
@@ -105,14 +107,6 @@ async function boot(opts = {}) {
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function waitFor(cond, ms = 2000) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    try { if (cond()) return true; } catch {}
-    await sleep(10);
-  }
-  try { return !!cond(); } catch { return false; }
-}
 
 let fail = 0;
 const ok = (label, cond) => { console.log((cond ? '  PASS  ' : '  FAIL  ') + label); if (!cond) fail++; };
@@ -578,6 +572,5 @@ const modalTitle = a => a.d.querySelector('#modalContent h2')?.textContent.repla
     eq('no uncaught errors', a.errs, []);
   });
 
-  console.log('\n' + (fail ? fail + ' FAILED' : 'all assertions ok'));
-  process.exit(fail ? 1 : 0);
-})().catch(e => { console.log('  FAIL  harness error: ' + (e && e.stack || e)); process.exit(1); });
+  finish(fail, allErrs.flat(), 'all assertions ok');
+})().catch(crash);
