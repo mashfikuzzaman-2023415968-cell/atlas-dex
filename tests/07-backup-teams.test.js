@@ -68,7 +68,9 @@ function makeFetch(env) {
         return res({}, false, 503);
       }
       if (!(id >= 1 && id <= SPECIES) && id !== 10100) return res({}, false, 404);   // an id PokéAPI does not have
-      return res(mkPoke(id, env.hostile));
+      const p = mkPoke(id, env.hostile);
+      if (env.types[id]) p.types = env.types[id].map(t => ({ type: { name: t } }));
+      return res(p);
     }
     if ((m = url.match(/\/pokemon-species\/(\d+)$/))) {
       const sid = +m[1], f = env.hostile ? H : null;
@@ -81,7 +83,7 @@ function makeFetch(env) {
     }
     if (url.includes('/evolution-chain/')) return res({ chain: { species: { name: 'mon1', url: '/pokemon-species/1/' }, evolves_to: [] } });
     if ((m = url.match(/\/move\/([^/]+)$/))) return res({ name: m[1], power: 90, accuracy: 100, pp: 15, priority: 0, type: { name: 'fire' },
-      damage_class: { name: env.hostile ? H : 'special' }, effect_entries: [{ language: { name: 'en' }, short_effect: 'x' }], learned_by_pokemon: [] });
+      damage_class: { name: env.dmgClass || (env.hostile ? H : 'special') }, effect_entries: [{ language: { name: 'en' }, short_effect: 'x' }], learned_by_pokemon: [] });
     if ((m = url.match(/\/ability\/([^/]+)$/))) return res({ name: m[1], effect_entries: [{ language: { name: 'en' }, short_effect: 'x' }], pokemon: [] });
     if ((m = url.match(/\/item\/([^/]+)$/))) return res({ name: m[1], cost: 200, category: { name: env.hostile ? H : 'held' }, sprites: { default: 'i.png' },
       effect_entries: [{ language: { name: 'en' }, short_effect: 'x' }], held_by_pokemon: [] });
@@ -93,10 +95,12 @@ function makeFetch(env) {
 const allErrs = [];
 
 /* opts: hash, seed (JSON-encoded into localStorage), seedRaw (stored verbatim),
-   failIds (Set-like of ids or '*'), failMode ('http' | 'throw'), hostile */
+   failIds (Set-like of ids or '*'), failMode ('http' | 'throw'), hostile,
+   types ({id: [type names]} overrides), dmgClass (damage class for every move) */
 async function boot(opts = {}) {
   const env = { calls: [], failIds: new Set(opts.failIds || []), failMode: opts.failMode || 'http', hostile: !!opts.hostile,
-    confirms: 0, copied: null, blob: null, downloaded: false, promptValue: 'Renamed', delayMs: 0 };
+    confirms: 0, copied: null, blob: null, downloaded: false, promptValue: 'Renamed', delayMs: 0,
+    types: opts.types || {}, dmgClass: opts.dmgClass || null };
   const dom = new JSDOM(html, { runScripts: 'dangerously', url: 'https://x.test/' + (opts.hash || ''), pretendToBeVisual: true });
   const w = dom.window;
   env.w = w; env.d = w.document; env.$ = id => w.document.getElementById(id);
@@ -271,7 +275,8 @@ const EVIL_BACKUP = {
 const EVIL_TEAM1_NAME = ('   ' + P + '  and a name far longer than twenty-four characters').trim().slice(0, 24).trim();
 const EXPECTED_TEAMS = [
   { name: EVIL_TEAM1_NAME, members: [
-    member(25, { moves: ['ember', 'surf', 'tackle', 'flamethrower'], ivs: { ...blank(31), 'special-defense': 0 }, evs: { ...blank(0), attack: 252 } }),
+    /* special-attack 5.5 is truncated to 5, not reset: older versions saved fractions. */
+    member(25, { moves: ['ember', 'surf', 'tackle', 'flamethrower'], ivs: { ...blank(31), 'special-attack': 5, 'special-defense': 0 }, evs: { ...blank(0), attack: 252 } }),
     member(10100),
     member(100000, { item: 'Life Orb', ability: 'flash-fire' }),
     member(4),
@@ -387,7 +392,9 @@ const EXPECTED_GAME = { streak: 0, best: 0, lastDaily: null, lastScore: null, la
     eq('every rule: boundaries kept, anything else falls back to its default', e.stored('atlasdex:teams'), [{ name: 'rules', members: [
       member(1, { level: 1, nature: 'adamant', ability: a50, item: x40, ivs: { ...blank(31), hp: 0 }, evs: { ...blank(0), hp: 252 }, moves: ['a'] }),
       member(2, { level: 100, nature: 'quirky', ability: 'flash-fire', item: 'Life Orb-2', ivs: blank(0), evs: blank(252) }),
-      member(3),
+      /* Fractions are truncated (older versions saved 1.5 from a typed input),
+         an over-long item is cut to 40 characters, everything else defaults. */
+      member(3, { item: x40, ivs: { ...blank(31), 'special-defense': 1 } }),
       member(100000, { moves: ['a', 'b', 'c', 'd'] }),
       member(5),
       member(6, { moves: ['ok-move', 'surf'] })
@@ -406,10 +413,10 @@ const EXPECTED_GAME = { streak: 0, best: 0, lastDaily: null, lastScore: null, la
     e.chg(e.d.querySelector('[data-ld="nature"]'), 'adamant');
     e.chg(e.d.querySelector('[data-ld="item"]'), "King's Rock!");
     e.click(e.d.querySelector('[data-ldclose]')); await waitFor(VIEWS(e)[2][1]);
-    eq('editor keeps what the boot sanitiser accepts (nature, item stripped to safe chars)',
-      [e.stored('atlasdex:teams')[0].members[0].nature, e.stored('atlasdex:teams')[0].members[0].item], ['adamant', 'Kings Rock']);
+    eq('editor keeps what the boot sanitiser accepts (nature, item stripped to safe chars, apostrophe kept)',
+      [e.stored('atlasdex:teams')[0].members[0].nature, e.stored('atlasdex:teams')[0].members[0].item], ['adamant', "King's Rock"]);
     e.click(e.d.querySelector('[data-showdown]')); await waitFor(() => !!e.copied);
-    ok('Showdown export works on the imported team', e.copied.includes('Mon25 @ Kings Rock') && e.copied.includes('Adamant Nature') && e.copied.includes('Level: 50') && e.copied.includes('Mon6'));
+    ok('Showdown export works on the imported team', e.copied.includes("Mon25 @ King's Rock") && e.copied.includes('Adamant Nature') && e.copied.includes('Level: 50') && e.copied.includes('Mon6'));
 
     // caps
     const many = Array.from({ length: 30000 }, (_, i) => i + 1);
@@ -734,6 +741,106 @@ const EXPECTED_GAME = { streak: 0, best: 0, lastDaily: null, lastScore: null, la
     ok('a well-formed #/move/ember link still opens that move', !e.$('overlay').hidden && e.calls.some(u => u.endsWith('/move/ember')));
   }
 
+  console.log('\n--- 1.2-1.5  FOLLOW-UPS FROM THE INDEPENDENT REVIEW ---');
+  {
+    // a non-iterable teams value in storage must not break boot (migrateTeams guards before iterating)
+    for (const raw of ['{"a":1}', '42', '"teams"', 'true']) {
+      const e = await boot({ seedRaw: { 'atlasdex:teams': raw } });
+      eq(`boot survives atlasdex:teams = ${raw} and repairs it`,
+        [e.$('totalStat').textContent, e.stored('atlasdex:teams')], [String(SPECIES), [{ name: 'Team 1', members: [] }]]);
+    }
+
+    // the pre-multi-team key is migrated, then removed
+    {
+      const e = await boot({ seed: { 'atlasdex:team': [25, H, { id: 6, item: H }] } });
+      eq('legacy single-team key: members migrated into atlasdex:teams', e.stored('atlasdex:teams'), [{ name: 'Team 1', members: [member(25), member(6)] }]);
+      eq('legacy single-team key is removed after migration', e.stored('atlasdex:team'), undefined);
+    }
+
+    // builds saved by older versions keep their values: fractions truncated, apostrophes kept
+    {
+      const old = { id: 25, level: 50.5, nature: 'adamant', item: "King's Rock", ivs: { ...blank(31), attack: 12.5 }, evs: { ...blank(0), attack: 10.5 }, moves: ['ember'] };
+      const e = await boot({ seed: { 'atlasdex:teams': [{ name: 'Old', members: [old] }] } });
+      eq('an older saved build survives boot', e.stored('atlasdex:teams'), [{ name: 'Old', members: [
+        member(25, { level: 50, nature: 'adamant', item: "King's Rock", ivs: { ...blank(31), attack: 12 }, evs: { ...blank(0), attack: 10 }, moves: ['ember'] })] }]);
+    }
+
+    // caught ids beyond the species list are kept but never inflate progress
+    {
+      const e = await boot({ seed: { 'atlasdex:caught': [1, 2, 19999] } });
+      eq('progress counts only listed species', [e.$('caughtCount').textContent, e.$('heroCaught').textContent, e.$('heroPct').textContent],
+        ['2', '2', Math.round(2 / SPECIES * 100) + '%']);
+      await e.go('#/progress', () => !!e.d.querySelector('.ring-inner'));
+      eq('Living Dex shows 2 of 30 and 6.7%', [e.d.querySelector('.panel-title .heading-count').textContent.replace(/\s/g, ''), e.d.querySelector('.ring-inner strong').textContent],
+        [`2/${SPECIES}`, (2 / SPECIES * 100).toFixed(1) + '%']);
+      eq('the extra id stays stored (a newer API may list it)', e.stored('atlasdex:caught'), [1, 2, 19999]);
+    }
+
+    // an import clears remembered load failures, so a member that now loads is not stuck as a placeholder
+    {
+      const e = await boot({ hash: '#/team', failIds: [5], seed: { 'atlasdex:teams': [{ name: 'T', members: [5] }] } });
+      await waitFor(() => !!e.d.querySelector('.team-slot.failed'), 20000);
+      e.failIds.delete(5);
+      eq('import accepted', await importObj(e, { app: 'AtlasDex', teams: [{ name: 'T', members: [5] }] }), 'Backup restored');
+      await waitFor(() => !!e.d.querySelector('[data-edit="5"]'), 20000);
+      ok('after an import the member loads without pressing Retry', !e.d.querySelector('.team-slot.failed') && !e.d.querySelector('.team-error'));
+      eq('...with exactly one new request', e.pokeCalls(5), 2);
+    }
+
+    // adding a member and opening the Team Builder at once does not fetch it twice
+    {
+      const e = await boot();
+      e.delayMs = 300;
+      const b = e.d.createElement('button'); b.dataset.team = '10100'; e.$('grid').appendChild(b);
+      e.click(b);
+      e.w.location.hash = '#/team';
+      await waitFor(() => !!e.d.querySelector('[data-edit="10100"]'), 20000);
+      await sleep(400);
+      eq('a member added just before opening the Team Builder is requested once', e.pokeCalls(10100), 1);
+      e.delayMs = 0;
+    }
+
+    // the loadout editor ignores values its own controls never produce
+    {
+      const e = await boot({ hash: '#/team', seed: { 'atlasdex:teams': [{ name: 'T', members: [member(1)] }] } });
+      await waitFor(() => !!e.d.querySelector('[data-edit="1"]'), 20000);
+      e.click(e.d.querySelector('[data-edit="1"]')); await waitFor(() => e.$('modalContent').innerHTML.includes('LOADOUT'));
+      const natureSel = e.d.querySelector('[data-ld="nature"]');
+      natureSel.insertAdjacentHTML('beforeend', '<option value="constructor">x</option>');
+      e.chg(natureSel, 'constructor');
+      const iv = e.d.createElement('input'); iv.dataset.iv = 'constructor'; iv.value = '5';
+      e.$('modalContent').appendChild(iv); iv.dispatchEvent(new e.w.Event('input', { bubbles: true }));
+      const slot = e.d.querySelector('[data-moveslot="0"]');
+      slot.insertAdjacentHTML('beforeend', '<option value="Bad Move!">x</option>');
+      e.chg(slot, 'Bad Move!');
+      await sleep(200);
+      const m = e.stored('atlasdex:teams')[0].members[0];
+      eq('editor ignores a nature, an IV key and a move that fail the rules', [m.nature, Object.keys(m.ivs).sort(), m.moves], ['hardy', Object.keys(blank(0)).sort(), []]);
+    }
+
+    // openPokemon itself refuses ids that are not whole, listed species numbers
+    {
+      const e = await boot();
+      for (const v of ['1.5', '-1', '0', String(SPECIES + 1)]) {
+        const el = e.d.createElement('button'); el.dataset.open = v; e.$('grid').appendChild(el);
+        e.click(el); await sleep(50);
+        ok(`data-open="${v}" does not open the modal`, e.$('overlay').hidden);
+      }
+    }
+
+    // a type or damage class named after an Object.prototype member never resolves to it
+    {
+      const e = await boot({ types: { 3: ['constructor', '__proto__'] }, dmgClass: 'constructor', hash: '#/team',
+        seed: { 'atlasdex:teams': [{ name: 'T', members: [member(3, { moves: ['ember'] })] }] } });
+      await waitFor(() => !!e.d.querySelector('[data-edit="3"]'), 20000);
+      ok('slot colour falls back instead of an inherited value', e.d.querySelector('.team-slot:not(.empty)').getAttribute('style').includes('#a8ef61'));
+      ok('type badges fall back to the neutral colour', [...e.d.querySelectorAll('.team-slot .type')].every(b => b.getAttribute('style').includes('#8a9ab1')));
+      e.click(e.d.querySelector('[data-edit="3"]')); await waitFor(() => e.$('modalContent').innerHTML.includes('LOADOUT'));
+      await waitFor(() => e.$('modalContent').innerHTML.includes(' pow'), 20000);
+      ok('move meta shows no inherited text for a damage class named "constructor"', !/function|native code/.test(e.$('modalContent').textContent));
+    }
+  }
+
   console.log('\n--- 1.1  THE HARNESS CAN FAIL ---');
   {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'atlasdex-harness-'));
@@ -813,7 +920,7 @@ const EXPECTED_GAME = { streak: 0, best: 0, lastDaily: null, lastScore: null, la
       ok('suite 05 fails a bad colour (the structural assertion is real)', colour.status !== 0 && /FAIL  bad colour for steel/.test(colour.stdout));
       mutate('return Math.floor((core + 5) * natureMod(nature, statName));', 'return Math.floor((core + 6) * natureMod(nature, statName));');
       ok('suite 06 exits non-zero when the stat formula is wrong', wrong(runSuite('06-battlemath.test.js')));
-      mutate("$('caughtCount').textContent = state.caught.size;", "$('caughtCount').textContent = 0;");
+      mutate("$('caughtCount').textContent = caught;", "$('caughtCount').textContent = 0;");
       ok('suite 01 exits non-zero when an assertion fails', wrong(runSuite('01-core.test.js')));
     } finally { fs.rmSync(copy, { recursive: true, force: true }); }
   }
