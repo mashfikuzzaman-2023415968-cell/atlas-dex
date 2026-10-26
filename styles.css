@@ -521,3 +521,29 @@ a.secondaryaction{display:inline-block;text-decoration:none}
   .ldrow{grid-template-columns:1fr .4fr .6fr .7fr .5fr;gap:6px;font-size:11px}
   .ld-in{padding:6px 4px;font-size:11px}
 }
+
+/* ===== v6 · keyboard focus and reduced motion ===== */
+/* The base :focus-visible rule only names button, a, input and select. Cards
+   and Team Builder slots are role="button" containers, so keyboard users got
+   no sign of where they were. */
+.poke-card:focus-visible,
+[role="button"][tabindex]:focus-visible{outline:3px solid var(--accent);outline-offset:3px;
+  box-shadow:0 0 0 6px #a8ef6130}
+/* Focus is moved onto the dialog box itself when it has nothing better to
+   take; the ring would only be noise there. */
+.modal:focus,.palette-box:focus{outline:none}
+
+/* Lime on white fails contrast, so light mode gets a darker ring. */
+.light .poke-card:focus-visible,
+.light [role="button"][tabindex]:focus-visible{outline-color:#1f6b2d;box-shadow:0 0 0 6px #2f8f3e26}
+
+/* People who ask their OS for less motion get none: the shimmer, hover lifts,
+   toast fade and every other animation or transition are switched off. */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}
+}
+
+@media(max-width:700px){
+  /* Two-column grid: keep the ring inside the viewport edge. */
+  .poke-card:focus-visible,[role="button"][tabindex]:focus-visible{outline-offset:1px;box-shadow:none}
+}

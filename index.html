@@ -58,7 +58,7 @@
     <div class="topactions">
       <button id="paletteButton" class="iconbtn palette-btn" title="Search everything (Ctrl+K)" aria-label="Search everything">⌘ <span>Search</span></button>
       <button id="shinyButton" class="iconbtn" title="Toggle shiny artwork" aria-label="Toggle shiny artwork" aria-pressed="false">✦</button>
-      <button id="themeButton" class="iconbtn" title="Toggle theme" aria-label="Toggle theme">☀</button>
+      <button id="themeButton" class="iconbtn" title="Toggle theme" aria-label="Toggle theme" aria-pressed="false">☀</button>
       <button id="randomButton" class="random-btn" title="Explore a random Pokémon">✦ <span>Surprise me</span></button>
     </div>
   </header>
@@ -150,7 +150,7 @@
 </div>
 
 <div id="overlay" class="overlay" hidden>
-  <div class="modal" role="dialog" aria-modal="true" aria-label="Pokémon details" id="detailModal">
+  <div class="modal" role="dialog" aria-modal="true" aria-label="Pokémon details" id="detailModal" tabindex="-1">
     <button class="modalclose" id="closeModal" aria-label="Close details">✕</button>
     <div id="modalContent"></div>
   </div>

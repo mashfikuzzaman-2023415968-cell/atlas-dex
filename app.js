@@ -43,7 +43,11 @@ const CHART = {
 };
 
 /* National Dex IDs of Legendary and Mythical species, so the filter needs no
-   extra network calls. Extend this list as new generations are released. */
+   extra network calls. The set mirrors PokéAPI's is_legendary || is_mythical
+   flags (verified 2026-10-27 against all 1025 species: 94 species). Keep it in
+   step with the API, not with fan lists: Paradox Pokémon such as Walking Wake
+   or Iron Crown are not flagged, so the detail modal would call them "Regular".
+   Extend this list as new generations are released. */
 const LEGENDARY = new Set([
   144,145,146,150,151,
   243,244,245,249,250,251,
@@ -53,8 +57,8 @@ const LEGENDARY = new Set([
   716,717,718,719,720,721,
   772,773,785,786,787,788,789,790,791,792,800,801,802,807,808,809,
   888,889,890,891,892,893,894,895,896,897,898,905,
-  1001,1002,1003,1004,1007,1008,1009,1010,1014,1015,1016,1017,
-  1020,1021,1022,1023,1024,1025
+  1001,1002,1003,1004,1007,1008,1014,1015,1016,1017,
+  1024,1025
 ]);
 
 const STAT_LABEL = {
@@ -83,6 +87,15 @@ function read(key, fallback) {
 }
 function store(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+}
+/* With no saved choice the theme follows the OS preference; once the user
+   toggles, their choice is stored and wins. matchMedia is missing in some
+   embedded webviews, hence the guard. */
+function initialTheme() {
+  const saved = read('atlasdex:theme', null);
+  if (saved === 'light' || saved === 'dark') return saved;
+  try { return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'; }
+  catch { return 'dark'; }
 }
 function toast(message) {
   const el = $('toast');
@@ -222,7 +235,7 @@ const state = {
   teams: read('atlasdex:teams', null) || [{ name: 'Team 1', members: read('atlasdex:team', []) }],
   activeTeam: read('atlasdex:activeTeam', 0),
   compare: read('atlasdex:compare', []),
-  theme: read('atlasdex:theme', 'dark'),
+  theme: initialTheme(),
   shiny: read('atlasdex:shiny', false),
   modalId: null,     // species id driving the modal
   formId: null,      // /pokemon id of the variety currently shown
@@ -434,6 +447,16 @@ function filtered() {
   return a;
 }
 
+/* Accessible names for the icon-only card buttons. Both labels change with the
+   state, so the in-place updaters below reuse these. They return plain text:
+   escape with safe() when interpolating into markup, not for setAttribute. */
+function heartLabel(name, on) {
+  return on ? `Remove ${name} from favorites` : `Add ${name} to favorites`;
+}
+function teamBtnLabel(name, on) {
+  return on ? `Remove ${name} from team` : `Add ${name} to team`;
+}
+
 function card(p) {
   const types = typesOf(p.id);
   const isCaught = state.caught.has(p.id);
@@ -442,10 +465,11 @@ function card(p) {
       aria-label="View ${safe(p.name)} details" style="--type-color:${COLORS[types[0]] || '#a8ef61'}">
     <div class="cardtop">
       <button class="catchbtn ${isCaught ? 'on' : ''}" data-catch="${p.id}"
-        title="${isCaught ? 'Caught' : 'Mark as caught'}" aria-pressed="${isCaught}">${isCaught ? '◉' : '○'}</button>
+        title="${isCaught ? 'Caught' : 'Mark as caught'}" aria-label="Mark ${safe(title(p.name))} as caught"
+        aria-pressed="${isCaught}">${isCaught ? '◉' : '○'}</button>
       <span class="number">${pad(p.id)}</span>
       <button class="heart ${state.favorites.has(p.id) ? 'liked' : ''}" data-fav="${p.id}"
-        aria-label="${state.favorites.has(p.id) ? 'Remove from' : 'Add to'} favorites"
+        aria-label="${safe(heartLabel(title(p.name), state.favorites.has(p.id)))}"
         aria-pressed="${state.favorites.has(p.id)}">${state.favorites.has(p.id) ? '♥' : '♡'}</button>
     </div>
     <div class="art-area">${art(p.id)}</div>
@@ -456,8 +480,9 @@ function card(p) {
         : `<span class="type" style="--type-color:#36445e">Gen ${genOf(p.id)}</span>`}</div>
     </div>
     <div class="cardactions">
-      <button class="compbtn ${onTeam ? 'on' : ''}" data-team="${p.id}" title="Add to team" aria-label="Add ${safe(p.name)} to team">⬢</button>
-      <button class="compbtn" data-compare="${p.id}" title="Add to compare" aria-label="Compare ${safe(p.name)}">⇄</button>
+      <button class="compbtn ${onTeam ? 'on' : ''}" data-team="${p.id}" title="${onTeam ? 'Remove from team' : 'Add to team'}"
+        aria-label="${safe(teamBtnLabel(title(p.name), onTeam))}">⬢</button>
+      <button class="compbtn" data-compare="${p.id}" title="Add to compare" aria-label="Compare ${safe(title(p.name))}">⇄</button>
     </div>
   </article>`;
 }
@@ -526,10 +551,24 @@ function reset() {
 function favorite(id) {
   state.favorites.has(id) ? state.favorites.delete(id) : state.favorites.add(id);
   store('atlasdex:favorites', [...state.favorites]);
-  if (state.modalId === id) showTab();
+  if (state.modalId === id) { showTab(); syncFavCard(id); syncCounts(); }
   else if (state.mode === 'all' || state.mode === 'favorites') render();
   else syncCounts();
   toast(state.favorites.has(id) ? 'Added to your favorites ♡' : 'Removed from favorites');
+}
+
+/* The detail modal can favorite a species whose card is still in the grid
+   behind it. Update that heart in place instead of re-rendering the grid. In
+   the Favorites view an un-favorited card has to leave the grid, so repaint. */
+function syncFavCard(id) {
+  if (state.mode === 'favorites') { render(); return; }
+  const on = state.favorites.has(id);
+  document.querySelectorAll(`.poke-card[data-open="${id}"] .heart`).forEach(b => {
+    b.classList.toggle('liked', on);
+    b.textContent = on ? '♥' : '♡';
+    b.setAttribute('aria-pressed', String(on));
+    b.setAttribute('aria-label', heartLabel(title(pokeName(id)), on));
+  });
 }
 
 function markCaught(id) {
@@ -568,7 +607,10 @@ async function addToTeam(id) {
   if (!state.details.has(id)) { try { state.details.set(id, await get(`${API}/pokemon/${id}`)); } catch {} }
   syncCounts();
   if (state.mode === 'team') renderTeam();
-  else document.querySelectorAll(`[data-team="${id}"]`).forEach(b => b.classList.toggle('on', hasMember(id)));
+  else document.querySelectorAll(`[data-team="${id}"]`).forEach(b => {
+    b.classList.toggle('on', hasMember(id));
+    if (b.classList.contains('compbtn')) b.setAttribute('aria-label', teamBtnLabel(title(pokeName(id)), hasMember(id)));
+  });
 }
 
 function compare(id) {
@@ -591,7 +633,8 @@ function renderDock() {
   if (!state.team.length || state.mode === 'team') { dock.hidden = true; return; }
   dock.hidden = false;
   $('dockSlots').innerHTML = memberIds().map(id =>
-    `<button class="dock-slot" data-open="${speciesIdOf(id)}" title="${safe(title(pokeName(id)))}">${art(id)}</button>`
+    `<button class="dock-slot" data-open="${speciesIdOf(id)}" title="${safe(title(pokeName(id)))}"
+      aria-label="Open ${safe(title(pokeName(id)))}">${art(id)}</button>`
   ).join('') + Array.from({ length: 6 - state.team.length }, () => '<span class="dock-slot empty-slot"></span>').join('');
 }
 
@@ -609,8 +652,7 @@ async function openPokemon(id) {
   if (!id || id > state.list.length) return;
   state.modalId = id; state.formId = id;
   state.tab = 'overview'; state.moveShown = 30; state.moveMethod = 'level-up';
-  $('overlay').hidden = false;
-  document.body.style.overflow = 'hidden';
+  showOverlay();
   $('modalContent').innerHTML = '<div class="empty">Loading Pokémon data…</div>';
   history.replaceState(null, '', `#/pokemon/${id}`);
   try {
@@ -648,13 +690,77 @@ async function switchForm(formId) {
   showTab();
 }
 
+/* ---- dialog focus ---------------------------------------------- */
+/* Both dialogs (detail modal, command palette) move focus in when they open,
+   keep Tab inside while open and hand focus back to whatever opened them. The
+   opener is often re-rendered meanwhile (a card, the team slots), so remember
+   a selector for it as well as the element. */
+let modalOpener = null, paletteOpener = null;
+
+function focusKey(el) {
+  if (!el) return null;
+  if (el.id) return '#' + CSS.escape(el.id);
+  const attr = [...el.attributes].find(a => a.name.startsWith('data-'));
+  return attr ? `${el.tagName.toLowerCase()}[${attr.name}="${CSS.escape(attr.value)}"]` : null;
+}
+function rememberFocus() {
+  const el = document.activeElement;
+  return el && el !== document.body ? { el, key: focusKey(el) } : null;
+}
+function restoreFocus(saved) {
+  if (!saved) return;
+  const el = saved.el.isConnected ? saved.el : (saved.key && document.querySelector(saved.key));
+  if (el && typeof el.focus === 'function') el.focus();
+}
+const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]):not([type="hidden"]),'
+  + 'select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+function trapTab(e, dialog) {
+  const items = [...dialog.querySelectorAll(FOCUSABLE)].filter(el => !el.closest('[hidden]'));
+  const first = items[0], last = items[items.length - 1];
+  const active = document.activeElement;
+  if (!first) { e.preventDefault(); dialog.focus(); return; }
+  if (!dialog.contains(active) || (e.shiftKey && (active === first || active === dialog))) {
+    e.preventDefault(); (e.shiftKey ? last : first).focus();
+  } else if (!e.shiftKey && active === last) {
+    e.preventDefault(); first.focus();
+  }
+}
+/* A re-render replaces the buttons inside the modal, so focus would fall to
+   <body>, outside the dialog. Put it back on the equivalent button, or on the
+   dialog itself. Inputs are left alone: refocusing a rebuilt field would move
+   the caret mid-typing (see 3.7). */
+function modalFocusKey() {
+  const a = document.activeElement;
+  return a && a.tagName === 'BUTTON' && $('modalContent').contains(a) ? focusKey(a) : null;
+}
+function keepModalFocus(key) {
+  if ($('overlay').hidden || $('detailModal').contains(document.activeElement)) return;
+  const el = key && $('modalContent').querySelector(key);
+  (el || $('detailModal')).focus();
+}
+
+/* Every modal flavour (Pokémon, entity, loadout editor, compare) opens here. */
+function showOverlay() {
+  const wasHidden = $('overlay').hidden;
+  if (wasHidden) modalOpener = rememberFocus();
+  $('overlay').hidden = false;
+  document.body.style.overflow = 'hidden';
+  if (wasHidden) $('closeModal').focus();
+}
+
 function closeModal() {
+  const wasOpen = !$('overlay').hidden;
+  const wasEditing = state.editing != null;
   state.modalId = null; state.formId = null; state.entity = null; state.editing = null;
   $('overlay').hidden = true;
   document.body.style.overflow = '';
   if (/^#\/(pokemon|move|ability|item)\//.test(location.hash)) {
     history.replaceState(null, '', state.mode === 'favorites' ? '#/favorites' : '#/');
   }
+  /* The editor changes moves and EVs behind the Team Builder, and it can be
+     dismissed with Escape or the backdrop as well as Done: refresh on any exit. */
+  if (wasEditing && state.mode === 'team') renderTeam();
+  if (wasOpen) { restoreFocus(modalOpener); modalOpener = null; }
 }
 
 function statRows(d) {
@@ -723,14 +829,23 @@ function breedingPanel(d, s) {
 
 /* ---- tab: moves ---- */
 function movesPanel(d) {
-  const rows = d.moves.map(m => {
-    const vg = m.version_group_details[m.version_group_details.length - 1];
-    return {
-      name: m.move.name,
-      method: vg?.move_learn_method?.name || 'unknown',
-      level: vg?.level_learned_at || 0
-    };
-  });
+  /* One row per (move, learn method): a move taught by level-up in one game and
+     by TM in another belongs under both chips. For each method keep the most
+     recent version group, so level-up shows the level from the newest game
+     that teaches it. Version-group ids ascend with release order; the array
+     position breaks ties and covers payloads without the URL. */
+  const rows = [];
+  for (const m of d.moves) {
+    const best = new Map();
+    (m.version_group_details || []).forEach(vg => {
+      const method = vg?.move_learn_method?.name || 'unknown';
+      const order = idOf(vg?.version_group?.url);
+      const cur = best.get(method);
+      if (!cur || order >= cur.order) best.set(method, { order, level: vg?.level_learned_at || 0 });
+    });
+    if (!best.size) best.set('unknown', { order: 0, level: 0 });
+    for (const [method, v] of best) rows.push({ name: m.move.name, method, level: v.level });
+  }
   const methods = [...new Set(rows.map(r => r.method))].sort();
   const active = methods.includes(state.moveMethod) ? state.moveMethod : methods[0];
   state.moveMethod = active;
@@ -871,6 +986,7 @@ function showTab() {
     : `${title(s.name)} · ${formLabel(pokeName(fid), s.name)}`;
 
   const tabs = ['overview','stats','matchups','evolution','breeding','moves','encounters'];
+  const focusKey0 = modalFocusKey();
   $('modalContent').innerHTML = `
     <div class="detail-hero" style="--detail-glow:${COLORS[types[0]] || '#355e47'}44">
       <div>
@@ -889,6 +1005,7 @@ function showTab() {
         `<button data-tab="${t}" class="${state.tab === t ? 'selected' : ''}">${title(t)}</button>`).join('')}</div>
       ${body}
     </div>`;
+  keepModalFocus(focusKey0);
 
   if (state.tab === 'evolution') loadEvolution(s);
   if (state.tab === 'moves') fillMoves();
@@ -1032,15 +1149,15 @@ function renderTeam() {
     const filled = mem.moves.filter(Boolean).length;
     const evs = evTotal(mem);
     return `<div class="team-slot" style="--type-color:${COLORS[types[0]] || '#a8ef61'}">
-      <button class="slot-remove" data-team="${id}" aria-label="Remove from team">✕</button>
-      <div data-open="${speciesIdOf(id)}" role="button" tabindex="0">${art(id)}
+      <button class="slot-remove" data-team="${id}" aria-label="Remove ${safe(title(pokeName(id)))} from team">✕</button>
+      <div data-open="${speciesIdOf(id)}" role="button" tabindex="0" aria-label="View ${safe(title(pokeName(id)))} details">${art(id)}
         <strong>${safe(title(pokeName(id)))}</strong>
         <div class="types">${types.map(typeBadge).join('')}</div></div>
       <div class="slot-build">
         <small>Lv ${mem.level} · ${safe(title(mem.nature))}</small>
         <small class="${filled === 4 ? 'good' : filled ? '' : 'missing'}">${filled}/4 moves${evs ? ` · ${evs} EVs` : ''}</small>
       </div>
-      <button class="slot-edit" data-edit="${id}">✎ Edit build</button>
+      <button class="slot-edit" data-edit="${id}" aria-label="Edit build for ${safe(title(pokeName(id)))}">✎ Edit build</button>
     </div>`;
   }).join('') + Array.from({ length: 6 - state.team.length }, () =>
     `<a class="team-slot empty" href="#/"><span>＋</span><small>Add a Pokémon</small></a>`).join('');
@@ -1228,8 +1345,7 @@ async function openMemberEditor(id) {
   if (!m) return;
   state.editing = id;
   state.modalId = null; state.entity = null;
-  $('overlay').hidden = false;
-  document.body.style.overflow = 'hidden';
+  showOverlay();
   $('modalContent').innerHTML = '<div class="empty">Loading loadout…</div>';
 
   if (!state.details.has(id)) {
@@ -1283,6 +1399,7 @@ function paintMemberEditor() {
   const coverage = attackingTypesOf(m, typesOf(id));
   const hits = TYPES.filter(t => coverage.some(a => effectiveness(a, [t]) > 1));
 
+  const focusKey0 = modalFocusKey();
   $('modalContent').innerHTML = `
     <div class="entity-hero loadout-hero">
       <div class="lh-art">${art(id)}</div>
@@ -1330,6 +1447,7 @@ function paintMemberEditor() {
         <button class="secondaryaction" data-ldreset="1">Reset EVs</button>
       </div>
     </div>`;
+  keepModalFocus(focusKey0);
 }
 
 /* Returns true when the element belonged to the loadout editor. */
@@ -1966,8 +2084,7 @@ async function loadAllOf(kind) {
 async function openEntity(kind, name) {
   state.entity = { kind, name };
   state.modalId = null;
-  $('overlay').hidden = false;
-  document.body.style.overflow = 'hidden';
+  showOverlay();
   $('modalContent').innerHTML = '<div class="empty">Loading…</div>';
   history.replaceState(null, '', `#/${kind}/${name}`);
   let d;
@@ -2024,10 +2141,21 @@ async function openEntity(kind, name) {
 }
 
 /* Jump from a name chip to that species' page. */
-function openByName(name) {
-  const base = name.split('-')[0];
-  const hit = state.list.find(p => p.name === name) || state.list.find(p => p.name === base);
-  if (hit) openPokemon(hit.id); else toast('That Pokémon is not in the species list');
+/* Names are often variety names ('mr-mime-galar', 'kommo-o-totem'), and
+   species names can themselves contain hyphens, so splitting on the first
+   hyphen is wrong. Take the longest species name that equals the name or
+   prefixes it, open that species, then switch to the variety if there is one
+   with exactly this name. */
+async function openByName(name) {
+  let species = null;
+  for (const p of state.list) {
+    if ((p.name === name || name.startsWith(p.name + '-')) && (!species || p.name.length > species.name.length)) species = p;
+  }
+  if (!species) { toast('That Pokémon is not in the species list'); return; }
+  await openPokemon(species.id);
+  if (name === species.name || state.modalId !== species.id) return;
+  const variety = varietiesOf(state.species.get(species.id)).find(v => v.name === name);
+  if (variety) await switchForm(variety.id);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2332,8 +2460,7 @@ async function renderCalculators() {
 async function openComparison() {
   if (state.compare.length !== 2) { toast('Choose two Pokémon using the ⇄ button'); location.hash = '#/'; return; }
   state.modalId = null;
-  $('overlay').hidden = false;
-  document.body.style.overflow = 'hidden';
+  showOverlay();
   $('modalContent').innerHTML = '<div class="empty">Preparing comparison…</div>';
   try {
     const [a, b] = await Promise.all(state.compare.map(id => get(`${API}/pokemon/${id}`)));
@@ -2375,6 +2502,7 @@ const ROUTES = [
 ];
 
 function openPalette() {
+  if (!state.palette.open) paletteOpener = rememberFocus();
   state.palette = { open: true, q: '', sel: 0 };
   $('palette').hidden = false;
   $('paletteInput').value = '';
@@ -2386,8 +2514,10 @@ function openPalette() {
   });
 }
 function closePalette() {
+  const wasOpen = state.palette.open;
   state.palette.open = false;
   $('palette').hidden = true;
+  if (wasOpen) { restoreFocus(paletteOpener); paletteOpener = null; }
 }
 
 function paletteResults() {
@@ -2417,7 +2547,8 @@ function paintPalette() {
   state.palette.rows = rows;
   if (state.palette.sel >= rows.length) state.palette.sel = Math.max(0, rows.length - 1);
   $('paletteResults').innerHTML = rows.length
-    ? rows.map((r, i) => `<button class="pal-row ${i === state.palette.sel ? 'on' : ''}" data-pal="${i}">
+    ? rows.map((r, i) => `<button class="pal-row ${i === state.palette.sel ? 'on' : ''}" data-pal="${i}"
+        aria-label="${safe([r.kind, r.label, r.sub].filter(Boolean).join(' '))}">
         <span class="pal-kind">${safe(r.kind)}</span>
         <span class="pal-label">${safe(r.label)}</span>
         <span class="pal-sub">${safe(r.sub || '')}</span></button>`).join('')
@@ -2512,7 +2643,7 @@ function showdownExport() {
 /* ------------------------------------------------------------------ */
 
 function route() {
-  const hash = location.hash;
+  let hash = location.hash;
 
   if (hash.startsWith('#/pokemon/')) {
     const id = Number(hash.split('/')[2]);
@@ -2520,7 +2651,15 @@ function route() {
     return;
   }
   const ent = hash.match(/^#\/(move|ability|item)\/(.+)$/);
-  if (ent) { if (state.list.length) openEntity(ent[1], decodeURIComponent(ent[2])); return; }
+  if (ent) {
+    /* A hand-edited or truncated link can hold a broken escape (%E0%A4%A):
+       decodeURIComponent throws, so fall back to the home view instead. */
+    let entName = null;
+    try { entName = decodeURIComponent(ent[2]); } catch {}
+    if (entName !== null) { if (state.list.length) openEntity(ent[1], entName); return; }
+    history.replaceState(null, '', '#/');
+    hash = '#/';
+  }
 
   if (state.modalId || state.entity || !$('overlay').hidden) closeModal();
 
@@ -2543,19 +2682,27 @@ function route() {
 /* INIT                                                                */
 /* ------------------------------------------------------------------ */
 
+/* init() runs again from "Try again", so the one-off controls are filled once. */
+let controlsBuilt = false;
+
 async function init() {
   migrateTeams();
   document.body.classList.toggle('light', state.theme === 'light');
+  syncThemeButton();
+  $('status').textContent = 'Fetching the Pokédex…';
   $('shinyButton').setAttribute('aria-pressed', String(state.shiny));
   $('shinyButton').classList.toggle('on', state.shiny);
 
-  TYPES.forEach(t => $('typeFilter').insertAdjacentHTML('beforeend',
-    `<option value="${t}">${title(t)}</option>`));
+  if (!controlsBuilt) {
+    controlsBuilt = true;
+    TYPES.forEach(t => $('typeFilter').insertAdjacentHTML('beforeend',
+      `<option value="${t}">${title(t)}</option>`));
 
-  for (let g = 1; g <= 9; g++) {
-    $('genFilter').insertAdjacentHTML('beforeend', `<option value="${g}">Generation ${g}</option>`);
-    $('sideGens').insertAdjacentHTML('beforeend',
-      `<button class="genitem" data-gen="${g}"><span>${String(g).padStart(2, '0')}</span> Generation ${ROMAN[g - 1]}</button>`);
+    for (let g = 1; g <= 9; g++) {
+      $('genFilter').insertAdjacentHTML('beforeend', `<option value="${g}">Generation ${g}</option>`);
+      $('sideGens').insertAdjacentHTML('beforeend',
+        `<button class="genitem" data-gen="${g}"><span>${String(g).padStart(2, '0')}</span> Generation ${ROMAN[g - 1]}</button>`);
+    }
   }
 
   $('grid').innerHTML = Array.from({ length: 12 }, () => '<div class="skeleton"></div>').join('');
@@ -2568,9 +2715,8 @@ async function init() {
     route();
   } catch {
     $('grid').innerHTML = `<div class="empty"><strong>Pokédex is temporarily unavailable</strong>
-      We couldn’t connect to PokéAPI.<br><button class="errorbutton" id="retryInit">Try again</button></div>`;
+      We couldn’t connect to PokéAPI.<br><button class="errorbutton" id="retryInit" data-retryinit="1">Try again</button></div>`;
     $('status').textContent = 'Unable to load Pokémon data';
-    $('retryInit').addEventListener('click', init);
   }
 }
 
@@ -2610,11 +2756,30 @@ $('loadMore').addEventListener('click', () => { state.shown += 36; render(); });
 $('randomButton').addEventListener('click', () => {
   if (state.list.length) openPokemon(state.list[Math.floor(Math.random() * state.list.length)].id);
 });
+/* The button shows the current theme (☀ light, ☾ dark) and is pressed while
+   light. A backup import also flips the body class, so a class observer keeps
+   the button right without every caller having to remember it. */
+function syncThemeButton() {
+  const light = document.body.classList.contains('light');
+  const b = $('themeButton');
+  b.textContent = light ? '☀' : '☾';
+  b.setAttribute('aria-pressed', String(light));
+}
+new MutationObserver(syncThemeButton).observe(document.body, { attributes: true, attributeFilter: ['class'] });
 $('themeButton').addEventListener('click', () => {
   document.body.classList.toggle('light');
   state.theme = document.body.classList.contains('light') ? 'light' : 'dark';
   store('atlasdex:theme', state.theme);
+  syncThemeButton();
 });
+/* Until the user picks a theme, follow the OS when it changes. */
+try {
+  window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', e => {
+    if (read('atlasdex:theme', null) !== null) return;
+    state.theme = e.matches ? 'light' : 'dark';
+    document.body.classList.toggle('light', e.matches);
+  });
+} catch {}
 $('shinyButton').addEventListener('click', e => {
   state.shiny = !state.shiny;
   store('atlasdex:shiny', state.shiny);
@@ -2664,10 +2829,26 @@ document.addEventListener('change', e => {
   }
 });
 
+/* The "/" shortcut: the search box lives in the Pokédex list, so from any other
+   view go home first. The hashchange listener is added after route's, so the
+   list is rendered by the time it runs. */
+function focusSearch() {
+  const focusIt = () => $('searchInput').focus();
+  if (!$('listSection').hidden) { focusIt(); return; }
+  if (location.hash === '#/') { route(); focusIt(); return; }
+  window.addEventListener('hashchange', focusIt, { once: true });
+  location.hash = '#/';
+}
+
 document.addEventListener('keydown', e => {
   /* Command palette */
   if ((e.key === 'k' || e.key === 'K') && (e.metaKey || e.ctrlKey)) {
     e.preventDefault(); state.palette.open ? closePalette() : openPalette(); return;
+  }
+  /* Keep Tab inside whichever dialog is on top. */
+  if (e.key === 'Tab') {
+    if (state.palette.open) trapTab(e, $('palette').querySelector('.palette-box'));
+    else if (!$('overlay').hidden) trapTab(e, $('detailModal'));
   }
   if (state.palette.open) {
     if (e.key === 'Escape') { e.preventDefault(); closePalette(); return; }
@@ -2678,15 +2859,19 @@ document.addEventListener('keydown', e => {
     return;
   }
   if (e.key === 'Escape' && !$('overlay').hidden) closeModal();
-  if (e.key === '/' && !['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) {
-    e.preventDefault(); $('searchInput').focus();
+  if (e.key === '/' && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)
+      && $('overlay').hidden) {
+    e.preventDefault(); focusSearch();
   }
   if (state.modalId && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)
       && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
     const next = state.modalId + (e.key === 'ArrowRight' ? 1 : -1);
     if (next >= 1 && next <= state.list.length) openPokemon(next);
   }
-  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('.poke-card')) {
+  /* Cards and the Team Builder slots are divs/articles with role=button, so
+     they need Enter and Space handled by hand. Nested real buttons are not
+     matched: they activate themselves. */
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('[role="button"][tabindex][data-open]')) {
     e.preventDefault(); openPokemon(Number(e.target.dataset.open));
   }
 });
@@ -2715,7 +2900,7 @@ document.addEventListener('click', e => {
   const form = hit('[data-form]');     if (form) { switchForm(Number(form.dataset.form)); return; }
 
   const edit = hit('[data-edit]');     if (edit) { openMemberEditor(Number(edit.dataset.edit)); return; }
-  if (hit('[data-ldclose]')) { closeModal(); renderTeam(); return; }
+  if (hit('[data-ldclose]')) { closeModal(); return; }
   const spread = hit('[data-ldspread]'); if (spread) { applySpread(spread.dataset.ldspread); return; }
   if (hit('[data-ldreset]')) {
     const m = findMember(state.editing);
@@ -2774,6 +2959,7 @@ document.addEventListener('click', e => {
   const ggen = hit('[data-gamegen]');  if (ggen) { state.gameGen = ggen.dataset.gamegen; renderGame(); return; }
 
   const chip = hit('[data-chip]');     if (chip) { setChip(chip.dataset.chip); return; }
+  if (hit('[data-retryinit]')) { init(); return; }
   const retry = hit('[data-retry]');   if (retry) { openPokemon(Number(retry.dataset.retry)); return; }
 
   if (hit('[data-clear-compare]')) {
