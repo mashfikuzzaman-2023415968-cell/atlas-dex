@@ -461,6 +461,11 @@ function sanitizeLoadedState() {
   if (stored('atlasdex:theme'))     store('atlasdex:theme', state.theme);
   if (stored('atlasdex:shiny'))     store('atlasdex:shiny', state.shiny);
   if (stored('atlasdex:game'))      store('atlasdex:game', state.gameStats);
+  /* The in-progress daily gets the same treatment: rebuilt field by field, or removed. */
+  if (stored(DAILY_KEY)) {
+    const d = sanitizeDaily(read(DAILY_KEY, null));
+    if (d) store(DAILY_KEY, d); else clearDaily();
+  }
 }
 
 const memberIds   = () => state.team.map(m => m.id);
@@ -1832,16 +1837,23 @@ const yesterdayKey = () => { const d = new Date(); d.setDate(d.getDate() - 1); r
 /* In-progress daily, so quitting and restarting cannot replay questions whose
    answers were already seen. Shape: { date, results: [bool], q, picked }. */
 const DAILY_KEY = 'atlasdex:daily';
+/* Structural check shared by the boot sanitiser and loadDaily(). Only the four
+   known fields are copied, so nothing else in a hand-edited value survives. */
+function sanitizeDaily(raw) {
+  const date = own(raw, 'date'), results = own(raw, 'results'), q = own(raw, 'q'), picked = own(raw, 'picked');
+  const valid = typeof date === 'string' && DATE_KEY.test(date)
+    && Array.isArray(results) && results.length <= ROUND && results.every(r => typeof r === 'boolean')
+    && inRange(q, 0, ROUND - 1)
+    && (results.length === q || results.length === q + 1)
+    && (picked === null || inRange(picked, 1, LIMITS.species))
+    && (results.length === q) === (picked === null);
+  return valid ? { date, results: results.slice(), q, picked } : null;
+}
 function loadDaily() {
-  const d = read(DAILY_KEY, null);
-  const valid = d && typeof d === 'object' && d.date === todayKey()
-    && Array.isArray(d.results) && d.results.length <= ROUND && d.results.every(r => typeof r === 'boolean')
-    && Number.isInteger(d.q) && d.q >= 0 && d.q < ROUND
-    && (d.results.length === d.q || d.results.length === d.q + 1)
-    && (d.picked === null || Number.isInteger(d.picked))
-    && (d.results.length === d.q) === (d.picked === null);
-  if (valid) return d;
-  if (d) clearDaily();
+  const raw = read(DAILY_KEY, null);
+  const d = sanitizeDaily(raw);
+  if (d && d.date === todayKey()) return d;
+  if (raw !== null) clearDaily();
   return null;
 }
 function saveDaily(g) {
@@ -2983,7 +2995,12 @@ function importData(file) {
       saveTeams();
     }
     if (c.compare)   { state.compare = c.compare; store('atlasdex:compare', c.compare); }
-    if (c.game)      { state.gameStats = c.game; store('atlasdex:game', c.game); }
+    if (c.game) {
+      state.gameStats = c.game; store('atlasdex:game', c.game);
+      /* A saved half-played daily would contradict the restored stats (e.g. a restored
+         lastDaily of today), so the restored stats win. */
+      clearDaily();
+    }
     if (c.theme) {
       state.theme = c.theme;
       document.body.classList.toggle('light', state.theme === 'light');
