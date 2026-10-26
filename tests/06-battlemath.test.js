@@ -58,3 +58,4 @@ console.log((inRange?'  PASS  ':'  FAIL  ')+'all probabilities within 0..1');if(
 console.log((catchChance(100,100,3,1,1)<0.05?'  PASS  ':'  FAIL  ')+'rate-3 legendary is very hard');if(!(catchChance(100,100,3,1,1)<0.05))fail++;
 
 console.log(fail?`\n${fail} FAILURES`:'\nAll battle-math tests passed');
+process.exit(fail?1:0);

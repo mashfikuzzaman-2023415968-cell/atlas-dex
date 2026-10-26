@@ -1,6 +1,7 @@
 const fs=require('fs'),{JSDOM}=require('jsdom');
 const {indexedDB,IDBKeyRange}=require('fake-indexeddb');
 const path=require('path');
+const {waitFor,trackErrors,finish,crash}=require('./harness');
 const dir=path.resolve(__dirname,'..');
 const html=fs.readFileSync(dir+'/index.html','utf8');
 const appjs=fs.readFileSync(dir+'/app.js','utf8');
@@ -57,7 +58,7 @@ w.navigator.storage={estimate:async()=>({usage:5e7,quota:2e9}),persist:async()=>
 let copied=null;
 w.navigator.clipboard={writeText:async t=>{copied=t}};
 w.localStorage.clear();
-const errs=[];w.addEventListener('error',e=>errs.push(e.message));
+const errs=trackErrors(w);
 w.eval(appjs);
 const d=w.document,$=id=>d.getElementById(id);
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
@@ -65,55 +66,70 @@ const click=el=>el.dispatchEvent(new w.MouseEvent('click',{bubbles:true}));
 
 (async()=>{
  let fail=0;const ok=(l,c)=>{console.log((c?'  PASS  ':'  FAIL  ')+l);if(!c)fail++};
- await wait(500);
+ await waitFor(()=>d.querySelectorAll('.poke-card').length>0);
  console.log('\n--- ALTERNATE FORMS ---');
+ // names of the types listed in the "Weak to" block of the matchups tab (null when there is no such block)
+ const weakBlock=()=>{
+   const b=[...d.querySelectorAll('.mu-block')].find(x=>/^Weak to/.test(x.querySelector('h4').textContent.trim()));
+   return b?[...b.querySelectorAll('.type')].map(e=>e.textContent.trim()).sort():null;
+ };
  // species 26 = raichu with an Alolan variety
- w.location.hash='#/pokemon/26'; await wait(600);
+ w.location.hash='#/pokemon/26'; await waitFor(()=>d.querySelectorAll('.formchip').length===2);
  ok('modal open on species 26', !$('overlay').hidden);
  ok('form selector shown', d.querySelectorAll('.formchip').length===2);
  ok('default form active', d.querySelector('.formchip.on').textContent.trim()==='Default');
  ok('default typing is Electric only', d.querySelectorAll('.detail-hero .type').length===1);
 
- click(d.querySelector('[data-tab="matchups"]')); await wait(200);
+ click(d.querySelector('[data-tab="matchups"]')); await waitFor(()=>weakBlock()!==null);
  const beforeGround=$('modalContent').innerHTML.includes('Ground');
  ok('base form matchups rendered', beforeGround);
+ // pure Electric is weak only to Ground, so the base form's 2x block is exactly that
+ ok('base form weak block is exactly [Ground]', JSON.stringify(weakBlock())===JSON.stringify(['Ground']));
 
  // switch to Alolan form
  const alola=[...d.querySelectorAll('.formchip')].find(b=>b.textContent.trim()==='Alola');
- click(alola); await wait(400);
+ click(alola); await waitFor(()=>d.querySelector('.formchip.on')&&d.querySelector('.formchip.on').textContent.trim()==='Alola');
  ok('Alolan form selected', d.querySelector('.formchip.on').textContent.trim()==='Alola');
  ok('title shows the form', $('modalContent').innerHTML.includes('Raichu · Alola'));
- click(d.querySelector('[data-tab="matchups"]')); await wait(250);
+ click(d.querySelector('[data-tab="matchups"]')); await waitFor(()=>weakBlock()!==null);
  const html2=$('modalContent').innerHTML;
  ok('Alolan gains Psychic typing', html2.includes('Psychic'));
- ok('matchups recomputed for form (Dark now 2x)', /Dark[\s\S]{0,120}2×/.test(html2)||html2.includes('Weak to'));
+ // Electric/Psychic takes 2x from Bug, Dark, Ghost and Ground; Electric is resisted (Electric 0.5 x Psychic 1)
+ const weak2=weakBlock();
+ ok('matchups recomputed for form: Dark and Ground in the 2x block', !!weak2&&weak2.includes('Dark')&&weak2.includes('Ground'));
+ ok('Electric is not in the 2x block', !!weak2&&!weak2.includes('Electric'));
+ ok('2x block is exactly Bug, Dark, Ghost, Ground', JSON.stringify(weak2)===JSON.stringify(['Bug','Dark','Ghost','Ground']));
+ ok('Dark cell in the full chart reads 2x', [...d.querySelectorAll('.mu-cell')].some(c=>c.querySelector('span').textContent==='Dark'&&c.querySelector('b').textContent==='2×'));
 
- click(d.querySelector('[data-tab="stats"]')); await wait(150);
+ click(d.querySelector('[data-tab="stats"]')); await waitFor(()=>$('modalContent').innerHTML.includes('Base statistics'));
  ok('stats tab works on form', $('modalContent').innerHTML.includes('Base statistics'));
 
  // add the FORM to the team
- click(d.querySelector('[data-tab="overview"]')); await wait(200);
- click($('modalContent').querySelector('[data-team]')); await wait(300);
+ click(d.querySelector('[data-tab="overview"]')); await waitFor(()=>!!$('modalContent').querySelector('[data-team]'));
+ click($('modalContent').querySelector('[data-team]')); await waitFor(()=>$('teamCount').textContent==='1');
  ok('form added to team', $('teamCount').textContent==='1');
  $('closeModal').dispatchEvent(new w.MouseEvent('click',{bubbles:true})); await wait(100);
- w.location.hash='#/team'; await wait(500);
+ w.location.hash='#/team'; await waitFor(()=>$('panel').innerHTML.includes('Coverage heatmap'));
  ok('team view names the form', $('panel').innerHTML.toLowerCase().includes('raichu alola'));
  ok('team analysis ran on form', $('panel').innerHTML.includes('Coverage heatmap'));
 
  console.log('\n--- OFFLINE DEX ---');
- w.location.hash='#/offline'; await wait(400);
+ w.location.hash='#/offline'; await waitFor(()=>$('panel').innerHTML.includes('Offline Dex'));
  ok('offline view rendered', $('panel').innerHTML.includes('Offline Dex'));
  ok('storage reported', $('panel').innerHTML.includes('MB'));
  const before=netCalls;
  click(d.querySelector('[data-dlstart]'));
- await wait(3000);
+ await waitFor(()=>$('dlLabel')&&/\d+ \/ 120/.test($('dlLabel').textContent)&&netCalls>before+10,6000);
  const entriesTxt=$('dlLabel')?$('dlLabel').textContent:'';
  ok('download made progress', /\d+ \/ 120/.test(entriesTxt));
  ok('download used the network', netCalls>before);
+ // the cache-first check below only means something once every record is stored
+ await waitFor(()=>$('panel').innerHTML.includes('FULLY AVAILABLE OFFLINE'),20000);
+ ok('download finished: the view reports the dex as fully available offline', $('panel').innerHTML.includes('FULLY AVAILABLE OFFLINE'));
  // cache-first: re-requesting should not hit network
  const n2=netCalls;
  w.location.hash='#/'; await wait(300);
- w.location.hash='#/pokemon/5'; await wait(400);
+ w.location.hash='#/pokemon/5'; await waitFor(()=>!$('overlay').hidden&&$('modalContent').innerHTML.includes('About'));
  ok('cached data served without network', netCalls===n2);
  $('closeModal').dispatchEvent(new w.MouseEvent('click',{bubbles:true})); await wait(100);
 
@@ -164,7 +180,5 @@ const click=el=>el.dispatchEvent(new w.MouseEvent('click',{bubbles:true}));
  w.location.hash='#/matchups'; await wait(250);
  ok('matchup calc still renders', d.querySelector('.result-card strong').textContent==='2×');
 
- console.log('\nruntime errors: '+(errs.length?errs.join(' | '):'none'));
- console.log(fail?`\n${fail} FAILURES`:'\nAll tests passed');
- process.exit(fail?1:0);
-})();
+ finish(fail,errs);
+})().catch(crash);

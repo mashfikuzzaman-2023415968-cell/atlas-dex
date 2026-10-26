@@ -10,11 +10,23 @@ function eff(a,ds){let m=1;const r=CHART[a]||{};for(const d of ds)m*=(d in r)?r[
 let fail=0;
 const t=(label,got,want)=>{const ok=got===want;console.log((ok?'  PASS  ':'  FAIL  ')+label+(ok?'':` got ${got} want ${want}`));if(!ok)fail++};
 
-// every type has a row, and every key is a real type
-console.log('  PASS  every type has a chart row and valid keys');
-for(const a of TYPES){ if(!CHART[a]){console.log('  FAIL  missing row',a);fail++;continue}
-  for(const d of Object.keys(CHART[a])) if(!TYPES.includes(d)){console.log('FAIL bad key',a,d);fail++} }
-for(const t2 of TYPES) if(!COLORS[t2]){console.log('FAIL missing color',t2);fail++}
+// every type has a row, every key is a real type, every multiplier is legal, every type has a colour
+const problems=[];
+if(!Array.isArray(TYPES)||TYPES.length!==18||new Set(TYPES).size!==18) problems.push('TYPES is not 18 distinct types');
+for(const a of TYPES){
+  if(!CHART[a]){problems.push('missing chart row for '+a);continue}
+  for(const [d,m] of Object.entries(CHART[a])){
+    if(!TYPES.includes(d)) problems.push(`bad key ${a} -> ${d}`);
+    if(![0,0.5,2].includes(m)) problems.push(`bad multiplier ${a} -> ${d} = ${m}`);
+  }
+  if(!COLORS[a]) problems.push('missing colour for '+a);
+  else if(!/^#[0-9a-f]{6}$/i.test(COLORS[a])) problems.push(`bad colour for ${a}: ${COLORS[a]}`);
+}
+for(const k of Object.keys(CHART)) if(!TYPES.includes(k)) problems.push('chart row for unknown type '+k);
+problems.forEach(p=>console.log('  FAIL  '+p));
+const structOk=problems.length===0;
+console.log((structOk?'  PASS  ':'  FAIL  ')+'every type has a chart row, valid keys and multipliers, and a colour');
+if(!structOk) fail+=problems.length;
 
 // known single-type matchups
 t('fire->grass',eff('fire',['grass']),2);
@@ -42,6 +54,7 @@ t('fire->Scizor(bug/steel)',eff('fire',['bug','steel']),4);
 
 // chart symmetry sanity: Steel resists a lot
 const steelResists=TYPES.filter(a=>eff(a,['steel'])<1).length;
-if(steelResists<9){console.log('FAIL steel should resist many types, got',steelResists);fail++}
+t('steel resists at least 9 types',steelResists>=9,true);
 
 console.log(fail?`\n${fail} FAILURES`:'\nAll type-chart tests passed ('+TYPES.length+' types verified)');
+process.exit(fail?1:0);

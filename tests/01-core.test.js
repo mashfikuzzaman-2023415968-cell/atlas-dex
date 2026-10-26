@@ -1,8 +1,13 @@
 const fs=require('fs'),{JSDOM}=require('jsdom');
 const path=require('path');
+const {waitFor,trackErrors,finish,crash}=require('./harness');
 const dir=path.resolve(__dirname,'..');
 const html=fs.readFileSync(dir+'/index.html','utf8');
 const appjs=fs.readFileSync(dir+'/app.js','utf8');
+// Large enough to include the legendary ids 144-146, 150 and 151 for the chip check.
+const N=160;
+// the app's own legendary list, so the expected chip count comes from shipped data
+const LEGENDARY=new Function('return '+appjs.match(/const LEGENDARY = (new Set\(\[[\s\S]*?\]\));/)[1])();
 
 const mkPoke=(id,types)=>({id,name:'mon'+id,height:10,weight:100,base_experience:60,
   types:types.map(t=>({type:{name:t}})),
@@ -15,7 +20,7 @@ const mkPoke=(id,types)=>({id,name:'mon'+id,height:10,weight:100,base_experience
 const TY=['fire','water','grass','electric','flying','steel','ghost','dragon'];
 global.fetch=async(url)=>{
   let data;
-  if(url.includes('pokemon-species?')) data={results:Array.from({length:60},(_,i)=>({name:'mon'+(i+1),url:'/pokemon-species/'+(i+1)+'/'}))};
+  if(url.includes('pokemon-species?')) data={results:Array.from({length:N},(_,i)=>({name:'mon'+(i+1),url:'/pokemon-species/'+(i+1)+'/'}))};
   else if(url.includes('/pokemon-species/')) data={name:'mon1',gender_rate:4,capture_rate:45,hatch_counter:20,base_happiness:50,
     egg_groups:[{name:'monster'}],growth_rate:{name:'medium-slow'},habitat:{name:'forest'},shape:{name:'upright'},
     is_legendary:false,is_mythical:false,is_baby:false,generation:{name:'generation-i'},
@@ -38,7 +43,7 @@ w.Audio=function(){return{play:async()=>{}}};
 w.confirm=()=>true;
 w.CSS={escape:s=>s.replace(/[^a-zA-Z0-9_-]/g,'\\$&')};
 w.localStorage.clear();
-const errs=[];w.addEventListener('error',e=>errs.push(e.message));
+const errs=trackErrors(w);
 
 w.eval(appjs);
 const d=w.document, $=id=>d.getElementById(id);
@@ -47,67 +52,77 @@ const click=el=>{el.dispatchEvent(new w.MouseEvent('click',{bubbles:true}))};
 
 (async()=>{
   let fail=0; const ok=(l,c)=>{console.log((c?'  PASS  ':'  FAIL  ')+l); if(!c)fail++};
-  await wait(400);
+  await waitFor(()=>d.querySelectorAll('.poke-card').length>0);
 
   ok('grid rendered cards', d.querySelectorAll('.poke-card').length>0);
-  ok('species total shown', $('totalStat').textContent==='60');
+  ok('species total shown', $('totalStat').textContent===String(N));
 
   // catch a pokemon
   click(d.querySelector('.catchbtn'));
-  await wait(50);
+  await waitFor(()=>$('caughtCount').textContent==='1');
   ok('caught counter incremented', $('caughtCount').textContent==='1');
   ok('hero % updated', $('heroPct').textContent!=='0%');
 
   // build a team of 3
   const teamBtns=[...d.querySelectorAll('[data-team]')].slice(0,3);
   for(const b of teamBtns){click(b);await wait(60)}
+  await waitFor(()=>$('teamCount').textContent==='3');
   ok('team has 3 members', $('teamCount').textContent==='3');
   ok('team dock visible', !$('teamDock').hidden);
 
   // team view
-  w.location.hash='#/team'; await wait(300);
+  w.location.hash='#/team'; await waitFor(()=>$('panel').innerHTML.includes('Coverage heatmap'));
   ok('team view rendered', $('panel').innerHTML.includes('Coverage heatmap'));
   ok('heatmap has 18 type rows', d.querySelectorAll('.heat-row').length===19);
   ok('verdict cards present', d.querySelectorAll('.verdict').length===4);
   ok('team slots = 6', d.querySelectorAll('.team-slot').length===6);
 
   // living dex
-  w.location.hash='#/progress'; await wait(200);
+  w.location.hash='#/progress'; await waitFor(()=>$('panel').innerHTML.includes('Living Dex'));
   ok('progress view rendered', $('panel').innerHTML.includes('Living Dex'));
   ok('9 generation bars', d.querySelectorAll('.genbar').length===9);
   ok('ring shows percent', !!d.querySelector('.ring-inner strong').textContent.match(/%/));
 
   // matchups
-  w.location.hash='#/matchups'; await wait(200);
+  w.location.hash='#/matchups'; await waitFor(()=>$('panel').innerHTML.includes('Type Matchup Calculator'));
   ok('matchup calculator rendered', $('panel').innerHTML.includes('Type Matchup Calculator'));
   ok('fire vs grass = 2x', d.querySelector('.result-card strong').textContent==='2×');
   const tps=[...d.querySelectorAll('[data-picker="def1"] .tp')];
-  click(tps.find(b=>b.dataset.val==='water')); await wait(120);
+  click(tps.find(b=>b.dataset.val==='water'));
+  await waitFor(()=>d.querySelector('.result-card strong').textContent==='½×');
   ok('fire vs water = 1/2x', d.querySelector('.result-card strong').textContent==='½×');
 
   // detail modal tabs
-  w.location.hash='#/'; await wait(250);
-  click(d.querySelector('.poke-card')); await wait(300);
+  w.location.hash='#/'; await waitFor(()=>d.querySelectorAll('.poke-card').length>0&&!$('listSection').hidden);
+  click(d.querySelector('.poke-card'));
+  await waitFor(()=>!$('overlay').hidden&&$('modalContent').innerHTML.includes('Abilities'));
   ok('modal opened', !$('overlay').hidden);
   ok('overview has abilities', $('modalContent').innerHTML.includes('Abilities'));
-  await wait(200);
+  await waitFor(()=>$('modalContent').innerHTML.includes('Powers up Fire'));
   ok('ability text loaded', $('modalContent').innerHTML.includes('Powers up Fire'));
 
   for(const [tab,needle] of [['stats','Base statistics'],['matchups','Defensive matchups'],
       ['evolution','Evolution family'],['breeding','EGG GROUPS'],['moves','Move']]){
-    click(d.querySelector(`[data-tab="${tab}"]`)); await wait(260);
+    click(d.querySelector(`[data-tab="${tab}"]`));
+    await waitFor(()=>$('modalContent').innerHTML.includes(needle));
     ok(`tab: ${tab}`, $('modalContent').innerHTML.includes(needle));
   }
+  await waitFor(()=>!!d.querySelector('.mv-pow')&&d.querySelector('.mv-pow').textContent==='40');
   ok('move table filled type', $('modalContent').innerHTML.includes('Fire'));
   ok('move power filled', !!d.querySelector('.mv-pow') && d.querySelector('.mv-pow').textContent==='40');
 
   // filters
   $('closeModal').dispatchEvent(new w.MouseEvent('click',{bubbles:true})); await wait(100);
-  click(d.querySelector('[data-chip="uncaught"]')); await wait(150);
-  ok('uncaught chip filters', $('resultCount').textContent==='59');
-  click(d.querySelector('[data-chip="legendary"]')); await wait(150);
-  ok('legendary chip applies', $('resultCount').textContent!=='59');
+  click(d.querySelector('[data-chip="uncaught"]'));
+  await waitFor(()=>$('resultCount').textContent===String(N-1));
+  ok('uncaught chip filters', $('resultCount').textContent===String(N-1));
+  click(d.querySelector('[data-chip="legendary"]'));
+  const wantLegendary=[...LEGENDARY].filter(id=>id>=1&&id<=N).length;
+  ok('fixture really contains legendary species', wantLegendary===5);
+  await waitFor(()=>$('resultCount').textContent===String(wantLegendary));
+  ok('legendary chip applies (exactly the 5 legendary ids in the list)', $('resultCount').textContent===String(wantLegendary));
+  ok('legendary chip leaves only legendary cards', d.querySelectorAll('.poke-card').length===wantLegendary
+    &&[...d.querySelectorAll('.poke-card')].every(c=>LEGENDARY.has(Number(c.dataset.open))));
 
-  console.log('\nruntime errors: '+(errs.length?errs.join(' | '):'none'));
-  console.log(fail?`\n${fail} FAILURES`:'\nAll smoke tests passed');
-})();
+  finish(fail,errs,'All smoke tests passed');
+})().catch(crash);

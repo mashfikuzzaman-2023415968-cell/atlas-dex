@@ -1,6 +1,7 @@
 const fs=require('fs'),{JSDOM}=require('jsdom');
 const {indexedDB,IDBKeyRange}=require('fake-indexeddb');
 const path=require('path');
+const {waitFor,trackErrors,finish,crash}=require('./harness');
 const dir=path.resolve(__dirname,'..');
 const html=fs.readFileSync(dir+'/index.html','utf8'),appjs=fs.readFileSync(dir+'/app.js','utf8');
 // move library with distinct types so coverage changes are observable
@@ -54,7 +55,7 @@ Object.defineProperty(w.navigator,'onLine',{value:true,configurable:true});
 w.navigator.storage={estimate:async()=>({usage:1,quota:2}),persist:async()=>true};
 let copied=null;w.navigator.clipboard={writeText:async t=>{copied=t}};
 w.localStorage.clear();
-const errs=[];w.addEventListener('error',e=>errs.push(e.message));
+const errs=trackErrors(w);
 w.eval(appjs);
 const d=w.document,$=id=>d.getElementById(id);
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
@@ -63,11 +64,12 @@ const typeIn=(el,v)=>{el.value=v;el.dispatchEvent(new w.Event('input',{bubbles:t
 const chg=(el,v)=>{el.value=v;el.dispatchEvent(new w.Event('change',{bubbles:true}))};
 (async()=>{
  let fail=0;const ok=(l,c)=>{console.log((c?'  PASS  ':'  FAIL  ')+l);if(!c)fail++};
- await wait(500);
+ await waitFor(()=>d.querySelectorAll('[data-team]').length>=3);
  console.log('\n--- BUILD A TEAM ---');
  const tb=[...d.querySelectorAll('[data-team]')].slice(0,3);
  for(const b of tb){click(b);await wait(200)}
- w.location.hash='#/team';await wait(700);
+ await waitFor(()=>$('teamCount').textContent==='3');
+ w.location.hash='#/team';await waitFor(()=>$('panel').innerHTML.includes('0/4 moves'));
  ok('3 members added',$('teamCount').textContent==='3');
  ok('slots show move progress',$('panel').innerHTML.includes('0/4 moves'));
  ok('slots show level and nature',$('panel').innerHTML.includes('Lv 50'));
@@ -75,7 +77,7 @@ const chg=(el,v)=>{el.value=v;el.dispatchEvent(new w.Event('change',{bubbles:tru
  const blindBefore=($('panel').innerHTML.match(/no answer/g)||[]).length;
 
  console.log('\n--- LOADOUT EDITOR ---');
- click(d.querySelector('[data-edit]'));await wait(600);
+ click(d.querySelector('[data-edit]'));await waitFor(()=>$('modalContent').innerHTML.includes('LOADOUT'));
  ok('editor opens',$('modalContent').innerHTML.includes('LOADOUT'));
  ok('4 move slots',d.querySelectorAll('[data-moveslot]').length===4);
  ok('6 IV inputs',d.querySelectorAll('[data-iv]').length===6);
@@ -89,12 +91,12 @@ const chg=(el,v)=>{el.value=v;el.dispatchEvent(new w.Event('change',{bubbles:tru
  ok('HP stat correct (183)',rows[0].querySelector('.ld-final').textContent==='183');
 
  // nature change should bump attack by 10%: 145+5=150 -> *1.1 = 165
- chg(d.querySelector('[data-ld="nature"]'),'adamant');await wait(300);
+ chg(d.querySelector('[data-ld="nature"]'),'adamant');await waitFor(()=>rows[1].querySelector('.ld-final').textContent==='165');
  ok('adamant raises attack to 165',rows[1].querySelector('.ld-final').textContent==='165');
  ok('nature arrow shown',rows[1].querySelector('.ld-label i.up'));
 
  // EV preset
- click(d.querySelector('[data-ldspread="attack"]'));await wait(350);
+ click(d.querySelector('[data-ldspread="attack"]'));await waitFor(()=>d.querySelector('[data-ev="attack"]').value==='252');
  const rows2=[...d.querySelectorAll('.ldrow:not(.ldhead)')];
  ok('preset sets 252 Atk EV',d.querySelector('[data-ev="attack"]').value==='252');
  // 130 base, 31 IV, 252 EV(63), lv50 -> floor((260+31+63)*50/100)=177; (177+5)*1.1=200.2 -> 200
@@ -102,18 +104,18 @@ const chg=(el,v)=>{el.value=v;el.dispatchEvent(new w.Event('change',{bubbles:tru
  ok('EV total displayed',$('modalContent').innerHTML.includes('508 / 510'));
 
  // over-limit warning
- typeIn(d.querySelector('[data-ev="defense"]'),'252');await wait(300);
+ typeIn(d.querySelector('[data-ev="defense"]'),'252');await waitFor(()=>!!d.querySelector('.evbar.over'));
  ok('EV bar flags over-limit',!!d.querySelector('.evbar.over'));
 
  // assign moves
- chg(d.querySelector('[data-moveslot="0"]'),'earthquake');await wait(500);
+ chg(d.querySelector('[data-moveslot="0"]'),'earthquake');await waitFor(()=>$('modalContent').innerHTML.includes('100 pow'));
  ok('move assigned shows type',$('modalContent').innerHTML.includes('Ground'));
  ok('move shows power',$('modalContent').innerHTML.includes('100 pow'));
- chg(d.querySelector('[data-moveslot="1"]'),'ice-beam');await wait(500);
- chg(d.querySelector('[data-moveslot="2"]'),'nasty-plot');await wait(500);
+ chg(d.querySelector('[data-moveslot="1"]'),'ice-beam');await waitFor(()=>$('modalContent').innerHTML.includes('Ice'));
+ chg(d.querySelector('[data-moveslot="2"]'),'nasty-plot');await waitFor(()=>$('modalContent').innerHTML.includes('Dark'));
  ok('coverage line present',$('modalContent').innerHTML.includes('super effective against'));
- chg(d.querySelector('[data-ld="item"]'),'life-orb');await wait(250);
- click(d.querySelector('[data-ldclose]'));await wait(500);
+ chg(d.querySelector('[data-ld="item"]'),'life-orb');
+ click(d.querySelector('[data-ldclose]'));await waitFor(()=>$('panel').innerHTML.includes('3/4 moves'));
  ok('editor closes back to team',$('panel').innerHTML.includes('Coverage heatmap'));
  ok('slot reflects 3 moves',$('panel').innerHTML.includes('3/4 moves'));
 
@@ -121,10 +123,11 @@ const chg=(el,v)=>{el.value=v;el.dispatchEvent(new w.Event('change',{bubbles:tru
  // give the other two members moves so coverage becomes exact
  for(const idx of [1,2]){
    const edits=[...d.querySelectorAll('[data-edit]')];
-   click(edits[idx]);await wait(600);
-   chg(d.querySelector('[data-moveslot="0"]'),'surf');await wait(450);
-   click(d.querySelector('[data-ldclose]'));await wait(450);
+   click(edits[idx]);await waitFor(()=>$('modalContent').innerHTML.includes('LOADOUT')&&!!d.querySelector('[data-moveslot="0"]'));
+   chg(d.querySelector('[data-moveslot="0"]'),'surf');await waitFor(()=>$('modalContent').innerHTML.includes('90 pow'));
+   click(d.querySelector('[data-ldclose]'));await waitFor(()=>$('panel').innerHTML.includes('Coverage heatmap'));
  }
+ await waitFor(()=>$('panel').innerHTML.includes('Exact — calculated from the damaging moves'));
  ok('coverage now exact',$('panel').innerHTML.includes('Exact — calculated from the damaging moves'));
  const blindAfter=($('panel').innerHTML.match(/no answer/g)||[]).length;
  ok('coverage recomputed from moves',blindAfter!==blindBefore);
@@ -132,7 +135,7 @@ const chg=(el,v)=>{el.value=v;el.dispatchEvent(new w.Event('change',{bubbles:tru
  ok('heatmap reflects move types',$('panel').innerHTML.includes('can hit'));
 
  console.log('\n--- SHOWDOWN EXPORT ---');
- click(d.querySelector('[data-showdown]'));await wait(300);
+ click(d.querySelector('[data-showdown]'));await waitFor(()=>!!copied&&copied.includes('@ Life Orb'));
  ok('export includes held item',copied.includes('@ Life Orb'));
  ok('export includes ability',copied.includes('Ability:'));
  ok('export includes EV line',/EVs: .*Atk/.test(copied));
@@ -142,8 +145,8 @@ const chg=(el,v)=>{el.value=v;el.dispatchEvent(new w.Event('change',{bubbles:tru
  ok('export has no blank move slots',!/- *$/m.test(copied.replace(/\n$/,'')));
 
  console.log('\n--- TEAM DAMAGE CALCULATOR ---');
- w.location.hash='#/calc';await wait(400);
- click(d.querySelector('[data-calctab="team-damage"]'));await wait(500);
+ w.location.hash='#/calc';await waitFor(()=>d.querySelectorAll('[data-calctab]').length===6);
+ click(d.querySelector('[data-calctab="team-damage"]'));await waitFor(()=>$('panel').innerHTML.includes('ATTACKER'));
  ok('team damage tab renders',$('panel').innerHTML.includes('ATTACKER'));
  ok('attacker picker lists team',d.querySelectorAll('[data-calc="atkId"] option').length===3);
  ok('move picker lists damaging moves only',
@@ -152,7 +155,7 @@ const chg=(el,v)=>{el.value=v;el.dispatchEvent(new w.Event('change',{bubbles:tru
  ok('damage range computed',/\d+ – \d+/.test($('panel').innerHTML));
  const dmg1=d.querySelector('.result-card strong').textContent;
  // mon1 is fire, mon4 is electric; earthquake (ground) vs electric = 2x
- chg(d.querySelector('[data-calc="defId"]'),'3');await wait(450);
+ chg(d.querySelector('[data-calc="defId"]'),'3');await waitFor(()=>$('panel').innerHTML.includes("Mon3's"));
  ok('changing defender changes damage',d.querySelector('.result-card strong').textContent!==dmg1);
  ok('defender selection actually applied',$('panel').innerHTML.includes("Mon3's"));
  ok('effectiveness surfaced',/[0-9¼½]×/.test($('panel').innerHTML));
@@ -165,14 +168,12 @@ const chg=(el,v)=>{el.value=v;el.dispatchEvent(new w.Event('change',{bubbles:tru
  ok('loadouts persisted to storage',saved[0].members[0].moves.includes('earthquake'));
  ok('EVs persisted',saved[0].members[0].evs.attack===252);
  ok('nature persisted',saved[0].members[0].nature==='adamant');
- w.location.hash='#/';await wait(400);
+ w.location.hash='#/';await waitFor(()=>d.querySelectorAll('.poke-card').length>0);
  ok('grid still renders',d.querySelectorAll('.poke-card').length>0);
- w.location.hash='#/moves';await wait(600);
+ w.location.hash='#/moves';await waitFor(()=>d.querySelectorAll('.dexrow[data-entity]').length>0);
  ok('moves dex still works',d.querySelectorAll('.dexrow[data-entity]').length>0);
- w.location.hash='#/matchups';await wait(300);
+ w.location.hash='#/matchups';await waitFor(()=>!!d.querySelector('.result-card strong'));
  ok('matchups still work',d.querySelector('.result-card strong').textContent==='2×');
 
- console.log('\nruntime errors: '+(errs.length?errs.join(' | '):'none'));
- console.log(fail?`\n${fail} FAILURES`:'\nAll tests passed');
- process.exit(fail?1:0);
-})();
+ finish(fail,errs);
+})().catch(crash);

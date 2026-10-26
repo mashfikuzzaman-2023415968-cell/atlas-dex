@@ -75,8 +75,25 @@ const pad = id => '#' + String(id).padStart(4, '0');
 const idOf = url => Number(String(url).match(/\/(\d+)\/?$/)?.[1] || 0);
 const genOf = id => GEN.findIndex((start, i) => id >= start && id < GEN[i + 1]) + 1;
 
+/* Ids and counters reach markup and URLs from storage and imported backups,
+   so they are coerced to numbers at the point of use instead of trusted. */
+const toId = v => { const n = Math.trunc(Number(v)); return Number.isFinite(n) && n > 0 ? n : 0; };
+const int0 = v => { const n = Math.trunc(Number(v)); return Number.isFinite(n) ? n : 0; };
+/* Own-property lookup, so a type named "constructor" never resolves to
+   something inherited from Object.prototype. */
+const typeColor = (t, fallback = '#8a9ab1') =>
+  Object.prototype.hasOwnProperty.call(COLORS, t) ? COLORS[t] : fallback;
+
+/* Shape checks shared by the sanitisers. They sit up here, as consts, because
+   the state literal below already uses asList while it is being built. */
+const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const own = (o, k) => (isObj(o) && hasOwn(o, k) ? o[k] : undefined);
+const inRange = (v, lo, hi) => typeof v === 'number' && Number.isInteger(v) && v >= lo && v <= hi;
+const asList = v => (Array.isArray(v) ? v : []);
+
 const sprite = (id, shiny) =>
-  `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/${shiny ? 'shiny/' : ''}${id}.png`;
+  `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/${shiny ? 'shiny/' : ''}${toId(id)}.png`;
 
 function read(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
@@ -217,11 +234,14 @@ const state = {
   mode: 'all',
   gen: '', type: '', search: '', sort: 'id-asc', chip: '',
   shown: 36,
-  favorites: new Set(read('atlasdex:favorites', [])),
-  caught: new Set(read('atlasdex:caught', [])),
-  teams: read('atlasdex:teams', null) || [{ name: 'Team 1', members: read('atlasdex:team', []) }],
+  /* Raw reads only. NATURES is a const declared much further down, so the
+     strict sanitising has to wait for init() (sanitizeLoadedState); asList just
+     keeps a corrupt value from throwing here and breaking boot. */
+  favorites: new Set(asList(read('atlasdex:favorites', []))),
+  caught: new Set(asList(read('atlasdex:caught', []))),
+  teams: read('atlasdex:teams', null) || [{ name: 'Team 1', members: asList(read('atlasdex:team', [])) }],
   activeTeam: read('atlasdex:activeTeam', 0),
-  compare: read('atlasdex:compare', []),
+  compare: asList(read('atlasdex:compare', [])),
   theme: read('atlasdex:theme', 'dark'),
   shiny: read('atlasdex:shiny', false),
   modalId: null,     // species id driving the modal
@@ -246,6 +266,8 @@ const state = {
   game: null,
   gameStats: read('atlasdex:game', { streak: 0, best: 0, lastDaily: null, lastScore: null }),
   gameGen: '',
+  teamFailed: new Set(),   // member ids whose /pokemon data failed to load this session
+  teamLoading: new Set(),  // member ids with a request in flight
   moveMethod: 'level-up',
   moveShown: 30,
   request: 0,
@@ -256,17 +278,28 @@ const state = {
    writes are routed to whichever saved team is currently selected. */
 Object.defineProperty(state, 'team', {
   get() {
-    if (!state.teams.length) state.teams = [{ name: 'Team 1', members: [] }];
-    const i = Math.min(state.activeTeam, state.teams.length - 1);
-    return state.teams[i].members;
+    if (!Array.isArray(state.teams) || !state.teams.length) state.teams = [{ name: 'Team 1', members: [] }];
+    return state.teams[activeIdx()].members;
   },
   set(v) {
-    const i = Math.min(state.activeTeam, state.teams.length - 1);
-    state.teams[i].members = v;
+    if (!Array.isArray(state.teams) || !state.teams.length) state.teams = [{ name: 'Team 1', members: [] }];
+    state.teams[activeIdx()].members = v;
     saveTeams();
   }
 });
+
+/* One clamp for the selected team. Storage and imports can hand us an
+   out-of-range or non-integer index, and every reader must agree on the
+   team it lands on (rename, delete, Showdown export, tab highlight). */
+function clampTeamIndex(n, len) {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(len - 1, Math.trunc(n)));
+}
+function activeIdx() {
+  return clampTeamIndex(state.activeTeam, Array.isArray(state.teams) ? state.teams.length : 0);
+}
 function saveTeams() {
+  state.activeTeam = activeIdx();
   store('atlasdex:teams', state.teams);
   store('atlasdex:activeTeam', state.activeTeam);
 }
@@ -294,12 +327,14 @@ function newMember(id) {
     moves: []
   };
 }
-/* Older saves stored plain numeric ids. */
+/* Older saves stored plain numeric ids. Anything that is neither a number nor
+   an object is not a member at all, so it becomes null and is dropped. */
 function normalizeMember(m) {
   if (typeof m === 'number') {
     return { id: m, level: 50, nature: 'hardy', ability: null, item: '',
              ivs: blankSpread(31), evs: blankSpread(0), moves: [] };
   }
+  if (!isObj(m)) return null;
   m.ivs = m.ivs || blankSpread(31);
   m.evs = m.evs || blankSpread(0);
   m.moves = m.moves || [];
@@ -308,7 +343,120 @@ function normalizeMember(m) {
   return m;
 }
 function migrateTeams() {
-  for (const t of state.teams) t.members = (t.members || []).map(normalizeMember);
+  /* A corrupt teams value is replaced by sanitizeLoadedState() straight after. */
+  if (!Array.isArray(state.teams)) return;
+  for (const t of state.teams) {
+    if (isObj(t)) t.members = asList(t.members).map(normalizeMember).filter(Boolean);
+  }
+}
+
+/* ---- sanitising stored and imported data ------------------------- */
+/* A backup is a file from a stranger, and localStorage can still hold whatever
+   an earlier import left in it, so every field is rebuilt into a fresh object
+   under strict rules. Unknown keys are never copied (which also rules out
+   prototype pollution) and values that fail a rule fall back to the default.
+   These run from init() and importData(), after NATURES exists. */
+
+const LIMITS = { species: 20000, pokemon: 100000, list: 20000, teams: 8, members: 6, scan: 100 };
+const SLUG = /^[a-z0-9-]{1,50}$/;
+const DATE_KEY = /^\d{4}-\d{2}-\d{2}$/;
+const BACKUP_VERSION = 5;
+
+function cleanIds(list, max) {
+  const out = [], seen = new Set();
+  for (const v of asList(list).slice(0, LIMITS.list)) {
+    if (inRange(v, 1, max) && !seen.has(v)) { seen.add(v); out.push(v); }
+  }
+  return out;
+}
+
+/* A held item is free text in the editor; keep only what a real item name uses. */
+const cleanItem = v => (typeof v === 'string' ? v.slice(0, 40).replace(/[^a-z0-9 -]/gi, '') : '');
+
+function sanitizeMember(raw) {
+  const m = normalizeMember(raw);
+  if (!m) return null;
+  const id = own(m, 'id');
+  if (!inRange(id, 1, LIMITS.pokemon)) return null;
+
+  const spread = (src, fallback, max) => {
+    const out = {};
+    for (const k of STAT_KEYS) { const v = own(src, k); out[k] = inRange(v, 0, max) ? v : fallback; }
+    return out;
+  };
+  const moves = [];
+  for (const n of asList(own(m, 'moves')).slice(0, LIMITS.scan)) {
+    if (typeof n === 'string' && SLUG.test(n) && !moves.includes(n)) moves.push(n);
+    if (moves.length === 4) break;
+  }
+  const level = own(m, 'level'), nature = own(m, 'nature'), ability = own(m, 'ability'), item = own(m, 'item');
+  return {
+    id,
+    level: inRange(level, 1, 100) ? level : 50,
+    nature: typeof nature === 'string' && hasOwn(NATURES, nature) ? nature : 'hardy',
+    ability: typeof ability === 'string' && SLUG.test(ability) ? ability : null,
+    item: typeof item === 'string' && item.length <= 40 && /^[a-z0-9 -]*$/i.test(item) ? item : '',
+    ivs: spread(own(m, 'ivs'), 31, 31),
+    evs: spread(own(m, 'evs'), 0, EV_STAT_MAX),
+    moves
+  };
+}
+
+/* Returns a clean array, or null when the value is not an array of teams. */
+function sanitizeTeams(raw) {
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  for (const t of raw.slice(0, LIMITS.teams)) {
+    if (!isObj(t)) continue;
+    const rawName = own(t, 'name');
+    const name = typeof rawName === 'string' ? rawName.trim().slice(0, 24).trim() : '';
+    const seen = new Set(), members = [];
+    for (const r of asList(own(t, 'members')).slice(0, LIMITS.scan)) {
+      const mem = sanitizeMember(r);
+      if (!mem || seen.has(mem.id)) continue;
+      seen.add(mem.id); members.push(mem);
+      if (members.length === LIMITS.members) break;
+    }
+    out.push({ name: name || 'Team ' + (out.length + 1), members });
+  }
+  return out;
+}
+
+function sanitizeGame(raw) {
+  const count = v => (inRange(v, 0, Number.MAX_SAFE_INTEGER) ? v : 0);
+  const daily = own(raw, 'lastDaily'), score = own(raw, 'lastScore'), grid = own(raw, 'lastGrid');
+  return {
+    streak: count(own(raw, 'streak')),
+    best: count(own(raw, 'best')),
+    lastDaily: typeof daily === 'string' && DATE_KEY.test(daily) ? daily : null,
+    lastScore: inRange(score, 0, ROUND) ? score : null,
+    lastGrid: typeof grid === 'string'
+      ? Array.from(grid).filter(c => c === '🟩' || c === '🟥').slice(0, ROUND).join('') : ''
+  };
+}
+
+/* Everything read from localStorage is re-validated at boot, so a malicious
+   import made by an older version cannot keep running on every load. */
+function sanitizeLoadedState() {
+  state.favorites = new Set(cleanIds([...state.favorites], LIMITS.species));
+  state.caught = new Set(cleanIds([...state.caught], LIMITS.species));
+  const teams = sanitizeTeams(state.teams);
+  state.teams = teams && teams.length ? teams : [{ name: 'Team 1', members: [] }];
+  state.activeTeam = clampTeamIndex(state.activeTeam, state.teams.length);
+  state.compare = cleanIds(state.compare, LIMITS.pokemon).slice(0, 2);
+  state.theme = state.theme === 'light' ? 'light' : 'dark';
+  state.shiny = state.shiny === true;
+  state.gameStats = sanitizeGame(state.gameStats);
+
+  /* Write the cleaned values back, but only where something was stored. */
+  const stored = key => { try { return localStorage.getItem(key) !== null; } catch { return false; } };
+  if (stored('atlasdex:favorites')) store('atlasdex:favorites', [...state.favorites]);
+  if (stored('atlasdex:caught'))    store('atlasdex:caught', [...state.caught]);
+  if (stored('atlasdex:teams') || stored('atlasdex:team')) saveTeams();
+  if (stored('atlasdex:compare'))   store('atlasdex:compare', state.compare);
+  if (stored('atlasdex:theme'))     store('atlasdex:theme', state.theme);
+  if (stored('atlasdex:shiny'))     store('atlasdex:shiny', state.shiny);
+  if (stored('atlasdex:game'))      store('atlasdex:game', state.gameStats);
 }
 
 const memberIds   = () => state.team.map(m => m.id);
@@ -333,14 +481,17 @@ function memberStats(m) {
 /* SHARED MARKUP                                                       */
 /* ------------------------------------------------------------------ */
 
-function art(id, cls = '') {
+/* The id is coerced to a positive integer first: it ends up inside URLs, an
+   inline handler and attributes, and team data can come from a stored import. */
+function art(rawId, cls = '') {
+  const id = toId(rawId);
   const name = safe(pokeName(id) || 'Pokémon');
   const fallback = `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/${state.shiny ? 'shiny/' : ''}${id}.png`;
-  return `<img class="${cls}" loading="lazy" src="${sprite(id, state.shiny)}" alt="${name} artwork"
+  return `<img class="${safe(cls)}" loading="lazy" src="${sprite(id, state.shiny)}" alt="${name} artwork"
     onerror="this.onerror=null;this.src='${fallback}'">`;
 }
 function typeBadge(t) {
-  return `<span class="type" style="--type-color:${COLORS[t] || '#8a9ab1'}">${safe(title(t))}</span>`;
+  return `<span class="type" style="--type-color:${typeColor(t)}">${safe(title(t))}</span>`;
 }
 function typesOf(id) {
   return state.details.get(id)?.types?.map(t => t.type.name) || [];
@@ -439,7 +590,7 @@ function card(p) {
   const isCaught = state.caught.has(p.id);
   const onTeam = hasMember(p.id);
   return `<article class="poke-card ${isCaught ? 'caught' : ''}" data-open="${p.id}" tabindex="0" role="button"
-      aria-label="View ${safe(p.name)} details" style="--type-color:${COLORS[types[0]] || '#a8ef61'}">
+      aria-label="View ${safe(p.name)} details" style="--type-color:${typeColor(types[0], '#a8ef61')}">
     <div class="cardtop">
       <button class="catchbtn ${isCaught ? 'on' : ''}" data-catch="${p.id}"
         title="${isCaught ? 'Caught' : 'Mark as caught'}" aria-pressed="${isCaught}">${isCaught ? '◉' : '○'}</button>
@@ -504,7 +655,7 @@ async function hydrate(ids) {
     if (token !== state.request) return;
     const card = document.querySelector(`.poke-card[data-open="${id}"]`);
     if (card) {
-      card.style.setProperty('--type-color', COLORS[d.types[0]?.type.name] || '#a8ef61');
+      card.style.setProperty('--type-color', typeColor(d.types[0]?.type.name, '#a8ef61'));
       const el = card.querySelector('.types');
       if (el) el.innerHTML = d.types.map(t => typeBadge(t.type.name)).join('');
     }
@@ -553,19 +704,28 @@ function markCaught(id) {
 }
 
 async function addToTeam(id) {
+  let added = false;
   if (hasMember(id)) {
     state.team = state.team.filter(m => m.id !== id);
+    /* Forget a failed load with the member, so adding it again tries afresh. */
+    state.teamFailed.delete(id);
     toast('Removed from your team');
   } else if (state.team.length >= 6) {
     toast('Your team is full — remove one first');
     return;
   } else {
+    state.teamFailed.delete(id);
     state.team.push(newMember(id));
     saveTeams();
+    added = true;
     toast('Added to your team ⬢');
   }
   saveTeams();
-  if (!state.details.has(id)) { try { state.details.set(id, await get(`${API}/pokemon/${id}`)); } catch {} }
+  /* Only a newly added member needs data. Removing one (a failed placeholder
+     included) must not trigger another request. */
+  if (added && !state.details.has(id)) {
+    try { state.details.set(id, await get(`${API}/pokemon/${id}`)); } catch { state.teamFailed.add(id); }
+  }
   syncCounts();
   if (state.mode === 'team') renderTeam();
   else document.querySelectorAll(`[data-team="${id}"]`).forEach(b => b.classList.toggle('on', hasMember(id)));
@@ -591,7 +751,7 @@ function renderDock() {
   if (!state.team.length || state.mode === 'team') { dock.hidden = true; return; }
   dock.hidden = false;
   $('dockSlots').innerHTML = memberIds().map(id =>
-    `<button class="dock-slot" data-open="${speciesIdOf(id)}" title="${safe(title(pokeName(id)))}">${art(id)}</button>`
+    `<button class="dock-slot" data-open="${toId(speciesIdOf(id))}" title="${safe(title(pokeName(id)))}">${art(id)}</button>`
   ).join('') + Array.from({ length: 6 - state.team.length }, () => '<span class="dock-slot empty-slot"></span>').join('');
 }
 
@@ -606,7 +766,7 @@ async function details(id) {
 }
 
 async function openPokemon(id) {
-  if (!id || id > state.list.length) return;
+  if (!Number.isInteger(id) || id < 1 || id > state.list.length) return;
   state.modalId = id; state.formId = id;
   state.tab = 'overview'; state.moveShown = 30; state.moveMethod = 'level-up';
   $('overlay').hidden = false;
@@ -660,7 +820,7 @@ function closeModal() {
 function statRows(d) {
   return d.stats.map(s => {
     const label = STAT_LABEL[s.stat.name] || title(s.stat.name);
-    return `<div class="statrow"><span>${safe(label)}</span><b>${s.base_stat}</b>
+    return `<div class="statrow"><span>${safe(label)}</span><b>${safe(s.base_stat)}</b>
       <div class="bar"><div style="width:${Math.min(100, s.base_stat / 255 * 100)}%"></div></div></div>`;
   }).join('');
 }
@@ -697,7 +857,9 @@ function breedingPanel(d, s) {
   const steps = s.hatch_counter != null ? ((s.hatch_counter + 1) * 255).toLocaleString() + ' steps' : '—';
   const catchPct = s.capture_rate != null ? (s.capture_rate / 255 * 100).toFixed(1) + '% at full HP' : '—';
 
-  const fact = (label, value) => `<div class="fact"><small>${label}</small><strong>${value}</strong></div>`;
+  /* Every value here is API data (egg groups, habitat, shape, growth rate), so
+     the helper escapes it once for all of them. */
+  const fact = (label, value) => `<div class="fact"><small>${label}</small><strong>${safe(value)}</strong></div>`;
 
   return `<h3 class="paneltitle">Breeding</h3>
     <div class="facts">
@@ -749,7 +911,7 @@ function movesPanel(d) {
         <span class="mv-name">${safe(title(r.name))}</span>
         <span class="mv-type">…</span><span class="mv-pow">…</span>
         <span class="mv-acc">…</span><span class="mv-pp">…</span>
-        <span class="mv-lv">${r.level || '—'}</span></div>`).join('')}
+        <span class="mv-lv">${safe(r.level || '—')}</span></div>`).join('')}
     </div>
     ${totalForMethod > state.moveShown
       ? `<div class="loadMoreWrap"><button class="loadmore" data-moremoves="1">Show more moves ↓</button></div>`
@@ -872,7 +1034,7 @@ function showTab() {
 
   const tabs = ['overview','stats','matchups','evolution','breeding','moves','encounters'];
   $('modalContent').innerHTML = `
-    <div class="detail-hero" style="--detail-glow:${COLORS[types[0]] || '#355e47'}44">
+    <div class="detail-hero" style="--detail-glow:${typeColor(types[0], '#355e47')}44">
       <div>
         <div class="detail-number">${pad(id)} · GENERATION ${genOf(id)}</div>
         <h2>${safe(activeName)}</h2>
@@ -933,8 +1095,8 @@ async function loadEncounters(pokeId) {
       <div class="enclist">
         ${[...areas.entries()].sort((a, b) => b[1].chance - a[1].chance).map(([area, info]) =>
           `<div class="encrow"><span>${safe(area)}</span>
-            <small>Lv ${info.lo}${info.hi !== info.lo ? '–' + info.hi : ''}</small>
-            <b>${info.chance ? info.chance + '%' : '—'}</b></div>`).join('')}
+            <small>Lv ${safe(info.lo)}${info.hi !== info.lo ? '–' + safe(info.hi) : ''}</small>
+            <b>${info.chance ? safe(info.chance) + '%' : '—'}</b></div>`).join('')}
       </div>
     </div>`).join('');
 }
@@ -1009,17 +1171,30 @@ function renderTeam() {
   document.querySelectorAll('.navitem').forEach(n => n.classList.toggle('active', n.dataset.nav === 'team'));
   syncCounts();
 
-  /* A team restored from localStorage has no cached /pokemon payloads yet. */
-  const missing = memberIds().filter(id => !state.details.has(id));
-  if (missing.length) {
+  /* A team restored from localStorage has no cached /pokemon payloads yet.
+     Each id is requested once: a failure is remembered for the session instead
+     of re-rendering into another request, which would loop for as long as the
+     data stays unreachable (offline, or an id PokéAPI does not have). Only the
+     Retry button clears that memory. */
+  const unloaded = memberIds().filter(id => !state.details.has(id));
+  const toFetch = unloaded.filter(id => !state.teamFailed.has(id) && !state.teamLoading.has(id));
+  if (unloaded.some(id => !state.teamFailed.has(id))) {
     $('panel').innerHTML = `<div class="kicker">STRATEGY</div><h2 class="panel-title">Team Builder</h2>
       <div class="empty">Analyzing your team…</div>`;
-    pool(missing, 6, async id => { state.details.set(id, await get(`${API}/pokemon/${id}`)); })
-      .then(() => { if (state.mode === 'team') renderTeam(); });
+    if (toFetch.length) {
+      toFetch.forEach(id => state.teamLoading.add(id));
+      pool(toFetch, 6, async id => {
+        try { state.details.set(id, await get(`${API}/pokemon/${id}`)); }
+        catch { state.teamFailed.add(id); }
+        finally { state.teamLoading.delete(id); }
+      }).then(() => { if (state.mode === 'team') renderTeam(); });
+    }
     return;
   }
 
-  const members = state.team.map(m => ({
+  /* From here every member is either loaded or known to have failed. */
+  const failed = state.team.filter(m => !state.details.has(m.id));
+  const members = state.team.filter(m => state.details.has(m.id)).map(m => ({
     id: m.id,
     loadout: m,
     name: pokeName(m.id),
@@ -1027,17 +1202,26 @@ function renderTeam() {
     stats: state.details.get(m.id)?.stats || []
   })).filter(m => m.types.length);
 
-  const slots = state.team.map(mem => { const id = mem.id;
+  const slots = state.team.map(mem => { const id = toId(mem.id);
+    if (!state.details.has(mem.id)) {
+      /* Still removable, but nothing to open or edit without its data. */
+      return `<div class="team-slot failed">
+        <button class="slot-remove" data-team="${id}" aria-label="Remove ${safe(title(pokeName(id)))} from team">✕</button>
+        <div class="slot-missing" aria-hidden="true">?</div>
+        <strong>${safe(title(pokeName(id)))}</strong>
+        <div class="slot-build"><small class="missing">Could not load</small></div>
+      </div>`;
+    }
     const types = typesOf(id);
     const filled = mem.moves.filter(Boolean).length;
     const evs = evTotal(mem);
-    return `<div class="team-slot" style="--type-color:${COLORS[types[0]] || '#a8ef61'}">
+    return `<div class="team-slot" style="--type-color:${typeColor(types[0], '#a8ef61')}">
       <button class="slot-remove" data-team="${id}" aria-label="Remove from team">✕</button>
-      <div data-open="${speciesIdOf(id)}" role="button" tabindex="0">${art(id)}
+      <div data-open="${toId(speciesIdOf(id))}" role="button" tabindex="0">${art(id)}
         <strong>${safe(title(pokeName(id)))}</strong>
         <div class="types">${types.map(typeBadge).join('')}</div></div>
       <div class="slot-build">
-        <small>Lv ${mem.level} · ${safe(title(mem.nature))}</small>
+        <small>Lv ${int0(mem.level)} · ${safe(title(mem.nature))}</small>
         <small class="${filled === 4 ? 'good' : filled ? '' : 'missing'}">${filled}/4 moves${evs ? ` · ${evs} EVs` : ''}</small>
       </div>
       <button class="slot-edit" data-edit="${id}">✎ Edit build</button>
@@ -1045,26 +1229,28 @@ function renderTeam() {
   }).join('') + Array.from({ length: 6 - state.team.length }, () =>
     `<a class="team-slot empty" href="#/"><span>＋</span><small>Add a Pokémon</small></a>`).join('');
 
-  const emptyTabs = `<div class="teamtabs">
-    ${state.teams.map((t, i) => `<button class="teamtab ${i === state.activeTeam ? 'on' : ''}" data-teamsel="${i}">
+  const teamTabs = `<div class="teamtabs">
+    ${state.teams.map((t, i) => `<button class="teamtab ${i === activeIdx() ? 'on' : ''}" data-teamsel="${i}">
       ${safe(t.name)} <i>${t.members.length}</i></button>`).join('')}
     ${state.teams.length < 8 ? '<button class="teamtab add" data-teamnew="1">＋ New team</button>' : ''}
   </div>`;
 
+  const loadError = failed.length
+    ? `<div class="team-error" role="alert">
+        <p>${failed.length} team member${failed.length === 1 ? '' : 's'} could not be loaded. Check your connection.</p>
+        <button class="errorbutton" data-teamretry="1">Retry</button>
+      </div>`
+    : '';
+
   if (!members.length) {
     $('panel').innerHTML = `<div class="kicker">STRATEGY</div><h2 class="panel-title">Team Builder</h2>
-      ${emptyTabs}
+      ${teamTabs}
+      ${loadError}
       <p class="dex-desc">Pick up to six Pokémon with the ⬢ button on any card. AtlasDex will map every shared weakness
       and every gap in your offensive coverage.</p>
       <div class="team-slots">${slots}</div>`;
     return;
   }
-
-  const teamTabs = `<div class="teamtabs">
-    ${state.teams.map((t, i) => `<button class="teamtab ${i === state.activeTeam ? 'on' : ''}" data-teamsel="${i}">
-      ${safe(t.name)} <i>${t.members.length}</i></button>`).join('')}
-    ${state.teams.length < 8 ? '<button class="teamtab add" data-teamnew="1">＋ New team</button>' : ''}
-  </div>`;
 
   const { defense, offense, exact } = analyzeTeam(members);
   const n = members.length;
@@ -1097,8 +1283,9 @@ function renderTeam() {
 
   $('panel').innerHTML = `
     <div class="kicker">STRATEGY</div>
-    <h2 class="panel-title">Team Builder <span class="heading-count">${n}/6</span></h2>
+    <h2 class="panel-title">Team Builder <span class="heading-count">${state.team.length}/6</span></h2>
     ${teamTabs}
+    ${loadError}
     <p class="dex-desc">Defensive column: how many of your team take extra damage from that type.
     Offensive column: how many can hit that type for super-effective damage.
     ${exact
@@ -1112,7 +1299,7 @@ function renderTeam() {
         <small>SHARED WEAKNESSES</small>
         ${threats.length
           ? `<div class="types">${threats.map(typeBadge).join('')}</div>
-             <p>${threats.length} type${threats.length > 1 ? 's' : ''} hit half your team or more. A single ${title(threats[0])} attacker could sweep you.</p>`
+             <p>${threats.length} type${threats.length > 1 ? 's' : ''} hit half your team or more. A single ${safe(title(threats[0]))} attacker could sweep you.</p>`
           : '<p>No type threatens half your team at once. This is a well-spread defensive core.</p>'}
       </div>
       <div class="verdict ${blind.length ? 'v-warn' : 'v-good'}">
@@ -1259,10 +1446,10 @@ function paintMemberEditor() {
     return `<div class="ldrow">
       <span class="ld-label">${safe(STAT_LABEL[k])}
         ${mod > 1 ? '<i class="up">▲</i>' : mod < 1 ? '<i class="down">▼</i>' : ''}</span>
-      <span class="ld-base">${s.base_stat}</span>
-      <input class="ld-in" type="number" min="0" max="31" value="${m.ivs[k] ?? 31}" data-iv="${k}" aria-label="${safe(STAT_LABEL[k])} IV">
-      <input class="ld-in" type="number" min="0" max="${EV_STAT_MAX}" step="4" value="${m.evs[k] ?? 0}" data-ev="${k}" aria-label="${safe(STAT_LABEL[k])} EV">
-      <span class="ld-final">${stats[k] ?? '—'}</span>
+      <span class="ld-base">${safe(s.base_stat)}</span>
+      <input class="ld-in" type="number" min="0" max="31" value="${int0(m.ivs[k] ?? 31)}" data-iv="${safe(k)}" aria-label="${safe(STAT_LABEL[k])} IV">
+      <input class="ld-in" type="number" min="0" max="${EV_STAT_MAX}" step="4" value="${int0(m.evs[k] ?? 0)}" data-ev="${safe(k)}" aria-label="${safe(STAT_LABEL[k])} EV">
+      <span class="ld-final">${safe(stats[k] ?? '—')}</span>
     </div>`;
   }).join('');
 
@@ -1275,7 +1462,7 @@ function paintMemberEditor() {
         ${learnable.map(n => `<option value="${safe(n)}" ${n === chosen ? 'selected' : ''}>${safe(title(n))}</option>`).join('')}
       </select>
       <span class="ms-meta">${mv
-        ? `${typeBadge(mv.type.name)}<small>${DMG_CLASS[mv.damage_class?.name] || ''} ${mv.power || '—'} pow · ${mv.accuracy ? mv.accuracy + '%' : '—'}</small>`
+        ? `${typeBadge(mv.type.name)}<small>${DMG_CLASS[mv.damage_class?.name] || ''} ${safe(mv.power || '—')} pow · ${mv.accuracy ? safe(mv.accuracy) + '%' : '—'}</small>`
         : '<small>No move selected</small>'}</span>
     </div>`;
   }).join('');
@@ -1295,13 +1482,13 @@ function paintMemberEditor() {
     <div class="detail-body">
       <div class="fieldgrid">
         <label class="field"><small>LEVEL</small>
-          <input type="number" min="1" max="100" value="${m.level}" data-ld="level"></label>
+          <input type="number" min="1" max="100" value="${int0(m.level)}" data-ld="level"></label>
         <label class="field"><small>NATURE</small>
           <select data-ld="nature">${Object.keys(NATURES).map(n =>
-            `<option value="${n}" ${n === m.nature ? 'selected' : ''}>${title(n)}${NATURES[n][0] ? ` (+${STAT_LABEL[NATURES[n][0]]} / −${STAT_LABEL[NATURES[n][1]]})` : ''}</option>`).join('')}</select></label>
+            `<option value="${safe(n)}" ${n === m.nature ? 'selected' : ''}>${safe(title(n))}${NATURES[n][0] ? ` (+${safe(STAT_LABEL[NATURES[n][0]])} / −${safe(STAT_LABEL[NATURES[n][1]])})` : ''}</option>`).join('')}</select></label>
         <label class="field"><small>ABILITY</small>
           <select data-ld="ability">${d.abilities.map(a =>
-            `<option value="${safe(a.ability.name)}" ${a.ability.name === m.ability ? 'selected' : ''}>${title(a.ability.name)}${a.is_hidden ? ' (hidden)' : ''}</option>`).join('')}</select></label>
+            `<option value="${safe(a.ability.name)}" ${a.ability.name === m.ability ? 'selected' : ''}>${safe(title(a.ability.name))}${a.is_hidden ? ' (hidden)' : ''}</option>`).join('')}</select></label>
         <label class="field"><small>HELD ITEM</small>
           <input type="text" list="itemList" placeholder="e.g. leftovers" value="${safe(m.item || '')}" data-ld="item"></label>
       </div>
@@ -1341,18 +1528,24 @@ function handleLoadoutEdit(t) {
   if (slot != null) { setMoveSlot(Number(slot), t.value); return true; }
 
   const iv = t.dataset?.iv;
-  if (iv) {
-    m.ivs[iv] = Math.max(0, Math.min(31, Number(t.value) || 0));
+  if (iv && STAT_KEYS.includes(iv)) {
+    m.ivs[iv] = Math.max(0, Math.min(31, Math.trunc(Number(t.value)) || 0));
     saveTeams(); refreshLoadoutStats(); return true;
   }
   const ev = t.dataset?.ev;
-  if (ev) {
-    m.evs[ev] = Math.max(0, Math.min(EV_STAT_MAX, Number(t.value) || 0));
+  if (ev && STAT_KEYS.includes(ev)) {
+    m.evs[ev] = Math.max(0, Math.min(EV_STAT_MAX, Math.trunc(Number(t.value)) || 0));
     saveTeams(); refreshLoadoutStats(); return true;
   }
   const ld = t.dataset?.ld;
   if (ld) {
-    m[ld] = ld === 'level' ? Math.max(1, Math.min(100, Number(t.value) || 1)) : t.value;
+    /* Same rules the boot-time sanitiser applies, so nothing saved here is
+       blanked or rewritten on the next load. */
+    if (ld === 'level')        m.level = Math.max(1, Math.min(100, Math.trunc(Number(t.value)) || 1));
+    else if (ld === 'item')    m.item = cleanItem(t.value);
+    else if (ld === 'nature')  { if (hasOwn(NATURES, t.value)) m.nature = t.value; }
+    else if (ld === 'ability') m.ability = SLUG.test(t.value) ? t.value : null;
+    else return false;
     saveTeams();
     if (ld === 'level' || ld === 'nature') refreshLoadoutStats();
     return true;
@@ -1374,7 +1567,7 @@ function refreshLoadoutStats() {
     const label = row.querySelector('.ld-label');
     if (label) {
       const mod = natureMod(m.nature, k);
-      label.innerHTML = `${STAT_LABEL[k]} ${mod > 1 ? '<i class="up">▲</i>' : mod < 1 ? '<i class="down">▼</i>' : ''}`;
+      label.innerHTML = `${safe(STAT_LABEL[k])} ${mod > 1 ? '<i class="up">▲</i>' : mod < 1 ? '<i class="down">▼</i>' : ''}`;
     }
   });
   const total = evTotal(m);
@@ -1398,7 +1591,7 @@ function applySpread(kind) {
 
 async function setMoveSlot(index, name) {
   const m = findMember(state.editing);
-  if (!m) return;
+  if (!m || (name && !SLUG.test(name))) return;
   const moves = [...m.moves];
   while (moves.length < 4) moves.push('');
   moves[index] = name;
@@ -1546,9 +1739,9 @@ function renderMatchups() {
     : result <= 0.25 ? 'Barely scratches it.'
     : 'Not very effective.';
 
-  const picker = (name, selected, allowNone) => `<div class="typepicker" data-picker="${name}">
+  const picker = (name, selected, allowNone) => `<div class="typepicker" data-picker="${safe(name)}">
     ${allowNone ? `<button class="tp ${!selected ? 'on' : ''}" data-val="">None</button>` : ''}
-    ${TYPES.map(t => `<button class="tp ${selected === t ? 'on' : ''}" data-val="${t}"
+    ${TYPES.map(t => `<button class="tp ${selected === t ? 'on' : ''}" data-val="${safe(t)}"
       style="--type-color:${COLORS[t]}">${safe(title(t))}</button>`).join('')}</div>`;
 
   $('panel').innerHTML = `
@@ -1564,12 +1757,12 @@ function renderMatchups() {
     ${picker('def2', state.def2, true)}
 
     <div class="result-card ${multClass(result)}">
-      <small>${safe(title(state.atk))} → ${defTypes.map(t => title(t)).join(' / ')}</small>
+      <small>${safe(title(state.atk))} → ${defTypes.map(t => safe(title(t))).join(' / ')}</small>
       <strong>${multLabel(result)}</strong>
       <p>${verdict}</p>
     </div>
 
-    <h3 class="paneltitle">Everything that hits ${defTypes.map(t => title(t)).join(' / ')}</h3>
+    <h3 class="paneltitle">Everything that hits ${defTypes.map(t => safe(title(t))).join(' / ')}</h3>
     <div class="mu-grid">${TYPES.map(t =>
       `<div class="mu-cell ${multClass(prof[t])}" style="--type-color:${COLORS[t]}">
         <span>${safe(title(t))}</span><b>${multLabel(prof[t])}</b></div>`).join('')}</div>`;
@@ -1696,9 +1889,9 @@ function renderGame() {
   const header = `<div class="kicker">DAILY CHALLENGE</div>
     <h2 class="panel-title">Who's That Pokémon?</h2>
     <div class="game-stats">
-      <div class="fact"><small>CURRENT STREAK</small><strong>${st.streak || 0} 🔥</strong></div>
-      <div class="fact"><small>BEST STREAK</small><strong>${st.best || 0}</strong></div>
-      <div class="fact"><small>TODAY</small><strong>${doneToday ? `${st.lastScore}/${ROUND} ✓` : 'Not played'}</strong></div>
+      <div class="fact"><small>CURRENT STREAK</small><strong>${int0(st.streak)} 🔥</strong></div>
+      <div class="fact"><small>BEST STREAK</small><strong>${int0(st.best)}</strong></div>
+      <div class="fact"><small>TODAY</small><strong>${doneToday ? `${int0(st.lastScore)}/${ROUND} ✓` : 'Not played'}</strong></div>
     </div>`;
 
   /* --- menu --- */
@@ -1710,7 +1903,7 @@ function renderGame() {
         <button class="gamecard ${doneToday ? 'done' : ''}" data-game="daily">
           <span class="gc-icon">◐</span>
           <strong>${doneToday ? "Replay today's challenge" : "Play today's challenge"}</strong>
-          <small>${doneToday ? `You scored ${st.lastScore}/${ROUND} — replaying won't change your streak` : `5 silhouettes · builds your streak`}</small>
+          <small>${doneToday ? `You scored ${int0(st.lastScore)}/${ROUND} — replaying won't change your streak` : `5 silhouettes · builds your streak`}</small>
         </button>
         <button class="gamecard" data-game="endless">
           <span class="gc-icon">∞</span>
@@ -1750,7 +1943,7 @@ function renderGame() {
       </div>
       <div class="detail-actions">
         <button class="primaryaction" data-share="1">Share result</button>
-        <button class="secondaryaction" data-game="${g.mode}">Play again</button>
+        <button class="secondaryaction" data-game="${safe(g.mode)}">Play again</button>
         <button class="secondaryaction" data-gamemenu="1">Back to menu</button>
       </div>`;
     return;
@@ -1854,10 +2047,10 @@ function browseRow(kind, r) {
     return `<button class="dexrow" data-entity="move:${safe(r.name)}">
       <span class="dx-name">${safe(title(r.name))}</span>
       <span class="dx-type">${d ? typeBadge(d.type.name) : '<i class="dx-wait"></i>'}</span>
-      <span class="dx-cls">${d ? (DMG_CLASS[d.damage_class?.name] || '') + ' ' + title(d.damage_class?.name || '') : ''}</span>
-      <span class="dx-num">${d ? (d.power ?? '—') : ''}</span>
-      <span class="dx-num">${d ? (d.accuracy ? d.accuracy + '%' : '—') : ''}</span>
-      <span class="dx-num">${d ? (d.pp ?? '—') : ''}</span>
+      <span class="dx-cls">${d ? safe((DMG_CLASS[d.damage_class?.name] || '') + ' ' + title(d.damage_class?.name || '')) : ''}</span>
+      <span class="dx-num">${d ? safe(d.power ?? '—') : ''}</span>
+      <span class="dx-num">${d ? (d.accuracy ? safe(d.accuracy) + '%' : '—') : ''}</span>
+      <span class="dx-num">${d ? safe(d.pp ?? '—') : ''}</span>
     </button>`;
   }
   if (kind === 'item') {
@@ -1866,7 +2059,7 @@ function browseRow(kind, r) {
       <span class="dx-img">${img ? `<img src="${safe(img)}" alt="" loading="lazy">` : ''}</span>
       <span class="dx-name">${safe(title(r.name))}</span>
       <span class="dx-cat">${d ? safe(title(d.category?.name || '')) : ''}</span>
-      <span class="dx-num">${d ? (d.cost ? '₽' + d.cost.toLocaleString() : '—') : ''}</span>
+      <span class="dx-num">${d ? (d.cost ? '₽' + safe(Number(d.cost).toLocaleString()) : '—') : ''}</span>
     </button>`;
   }
   return `<button class="dexrow ability" data-entity="ability:${safe(r.name)}">
@@ -1898,15 +2091,15 @@ async function renderBrowse(kind) {
 
   const filters = kind === 'move'
     ? `<select id="brFilter"><option value="">All types &amp; classes</option>
-        <optgroup label="Type">${TYPES.map(t => `<option value="${t}" ${b.filter === t ? 'selected' : ''}>${title(t)}</option>`).join('')}</optgroup>
-        <optgroup label="Category">${['physical','special','status'].map(c => `<option value="${c}" ${b.filter === c ? 'selected' : ''}>${title(c)}</option>`).join('')}</optgroup>
+        <optgroup label="Type">${TYPES.map(t => `<option value="${safe(t)}" ${b.filter === t ? 'selected' : ''}>${safe(title(t))}</option>`).join('')}</optgroup>
+        <optgroup label="Category">${['physical','special','status'].map(c => `<option value="${safe(c)}" ${b.filter === c ? 'selected' : ''}>${safe(title(c))}</option>`).join('')}</optgroup>
        </select>
        <select id="brSort"><option value="">Sort: A to Z</option>
         <option value="power" ${b.sort === 'power' ? 'selected' : ''}>Sort: highest power</option></select>`
     : kind === 'item'
     ? `<select id="brFilter"><option value="">All categories</option>
         ${[...new Set([...state.items.values()].map(d => d.category?.name).filter(Boolean))].sort()
-          .map(c => `<option value="${c}" ${b.filter === c ? 'selected' : ''}>${title(c)}</option>`).join('')}
+          .map(c => `<option value="${safe(c)}" ${b.filter === c ? 'selected' : ''}>${safe(title(c))}</option>`).join('')}
        </select>`
     : '';
 
@@ -1982,13 +2175,13 @@ async function openEntity(kind, name) {
     body = `<div class="facts">
         <div class="fact"><small>TYPE</small><strong>${safe(title(d.type.name))}</strong></div>
         <div class="fact"><small>CATEGORY</small><strong>${safe(title(d.damage_class?.name || '—'))}</strong></div>
-        <div class="fact"><small>POWER</small><strong>${d.power ?? '—'}</strong></div>
-        <div class="fact"><small>ACCURACY</small><strong>${d.accuracy ? d.accuracy + '%' : '—'}</strong></div>
-        <div class="fact"><small>PP</small><strong>${d.pp ?? '—'}</strong></div>
-        <div class="fact"><small>PRIORITY</small><strong>${d.priority > 0 ? '+' + d.priority : d.priority ?? 0}</strong></div>
+        <div class="fact"><small>POWER</small><strong>${safe(d.power ?? '—')}</strong></div>
+        <div class="fact"><small>ACCURACY</small><strong>${d.accuracy ? safe(d.accuracy) + '%' : '—'}</strong></div>
+        <div class="fact"><small>PP</small><strong>${safe(d.pp ?? '—')}</strong></div>
+        <div class="fact"><small>PRIORITY</small><strong>${safe(d.priority > 0 ? '+' + d.priority : d.priority ?? 0)}</strong></div>
       </div>
       <h3 class="paneltitle">Effect</h3><p class="dex-desc">${safe(englishEffect(d))}</p>
-      ${d.effect_chance ? `<p class="dex-desc">Effect chance: ${d.effect_chance}%</p>` : ''}
+      ${d.effect_chance ? `<p class="dex-desc">Effect chance: ${safe(d.effect_chance)}%</p>` : ''}
       <h3 class="paneltitle">Learned by ${(d.learned_by_pokemon || []).length} Pokémon</h3>
       <div>${learners.map(p => `<span class="pill" data-openname="${safe(p.name)}">${safe(title(p.name))}</span>`).join('') || '<p class="dex-desc">None.</p>'}</div>
       ${(d.learned_by_pokemon || []).length > 60 ? '<p class="dex-desc">Showing the first 60.</p>' : ''}`;
@@ -2007,8 +2200,8 @@ async function openEntity(kind, name) {
     body = `${img ? `<div class="itemart"><img src="${safe(img)}" alt="${safe(d.name)}"></div>` : ''}
       <div class="facts">
         <div class="fact"><small>CATEGORY</small><strong>${safe(title(d.category?.name || '—'))}</strong></div>
-        <div class="fact"><small>COST</small><strong>${d.cost ? '₽' + d.cost.toLocaleString() : '—'}</strong></div>
-        <div class="fact"><small>FLING POWER</small><strong>${d.fling_power ?? '—'}</strong></div>
+        <div class="fact"><small>COST</small><strong>${d.cost ? '₽' + safe(Number(d.cost).toLocaleString()) : '—'}</strong></div>
+        <div class="fact"><small>FLING POWER</small><strong>${safe(d.fling_power ?? '—')}</strong></div>
       </div>
       <h3 class="paneltitle">Effect</h3><p class="dex-desc">${safe(englishEffect(d))}</p>
       ${d.held_by_pokemon?.length ? `<h3 class="paneltitle">Held in the wild by</h3>
@@ -2097,14 +2290,14 @@ function catchChance(maxHp, currentHp, captureRate, ballMult, statusMult) {
 /* ------------------------------------------------------------------ */
 
 const num = (id, label, val, min, max, step) =>
-  `<label class="field"><small>${label}</small>
-    <input type="number" data-calc="${id}" value="${val}" min="${min}" max="${max}" step="${step || 1}"></label>`;
+  `<label class="field"><small>${safe(label)}</small>
+    <input type="number" data-calc="${safe(id)}" value="${safe(val)}" min="${safe(min)}" max="${safe(max)}" step="${safe(step || 1)}"></label>`;
 const sel = (id, label, val, opts) =>
-  `<label class="field"><small>${label}</small><select data-calc="${id}">
+  `<label class="field"><small>${safe(label)}</small><select data-calc="${safe(id)}">
     ${opts.map(o => `<option value="${safe(o)}" ${String(o) === String(val) ? 'selected' : ''}>${safe(title(String(o)))}</option>`).join('')}
   </select></label>`;
 const chk = (id, label, val) =>
-  `<label class="field check"><input type="checkbox" data-calc="${id}" ${val ? 'checked' : ''}><small>${label}</small></label>`;
+  `<label class="field check"><input type="checkbox" data-calc="${safe(id)}" ${val ? 'checked' : ''}><small>${safe(label)}</small></label>`;
 
 function statsCalcPanel() {
   const c = state.calc;
@@ -2152,7 +2345,7 @@ function teamDamagePanel() {
 
   const picker = (key, cur) => `<label class="field"><small>${key === 'atkId' ? 'ATTACKER' : 'DEFENDER'}</small>
     <select data-calc="${key}">${roster.map(m =>
-      `<option value="${m.id}" ${m.id === cur.id ? 'selected' : ''}>${safe(title(pokeName(m.id)))} (Lv ${m.level})</option>`).join('')}</select></label>`;
+      `<option value="${toId(m.id)}" ${m.id === cur.id ? 'selected' : ''}>${safe(title(pokeName(m.id)))} (Lv ${int0(m.level)})</option>`).join('')}</select></label>`;
 
   if (!move) {
     return `<div class="fieldgrid">${picker('atkId', atkM)}${picker('defId', defM)}</div>
@@ -2182,7 +2375,7 @@ function teamDamagePanel() {
       ${picker('atkId', atkM)}
       <label class="field"><small>MOVE</small>
         <select data-calc="moveName">${aMoves.map(mv =>
-          `<option value="${safe(mv.name)}" ${mv.name === move.name ? 'selected' : ''}>${safe(title(mv.name))} (${mv.power})</option>`).join('')}</select></label>
+          `<option value="${safe(mv.name)}" ${mv.name === move.name ? 'selected' : ''}>${safe(title(mv.name))} (${safe(mv.power)})</option>`).join('')}</select></label>
       ${picker('defId', defM)}
     </div>
     <div class="checkrow">
@@ -2209,7 +2402,7 @@ function teamDamagePanel() {
     <div class="facts">
       <div class="fact"><small>ATTACK USED</small><strong>${atk}</strong></div>
       <div class="fact"><small>DEFENCE USED</small><strong>${def}</strong></div>
-      <div class="fact"><small>MOVE POWER</small><strong>${move.power}</strong></div>
+      <div class="fact"><small>MOVE POWER</small><strong>${safe(move.power)}</strong></div>
       <div class="fact"><small>EFFECTIVENESS</small><strong>${multLabel(typeMult)}</strong></div>
     </div>`;
 }
@@ -2437,9 +2630,9 @@ function runPalette(i) {
 
 function exportData() {
   const payload = {
-    app: 'AtlasDex', version: 4, exported: new Date().toISOString(),
+    app: 'AtlasDex', version: BACKUP_VERSION, exported: new Date().toISOString(),
     favorites: [...state.favorites], caught: [...state.caught],
-    teams: state.teams, activeTeam: state.activeTeam,
+    teams: state.teams, activeTeam: activeIdx(),
     compare: state.compare, game: state.gameStats,
     settings: { theme: state.theme, shiny: state.shiny }
   };
@@ -2453,20 +2646,78 @@ function exportData() {
   toast('Backup downloaded');
 }
 
+/* A real backup is a few hundred KB at most (every species caught, eight full
+   teams). Anything far beyond that is not one, so it is refused unread. */
+const IMPORT_MAX_BYTES = 2 * 1024 * 1024;
+
+/* Turns parsed JSON into a clean backup, or says why it cannot be one. Nothing
+   in `d` is ever copied through: each field is rebuilt by its sanitiser. */
+function sanitizeBackup(d) {
+  if (!isObj(d) || own(d, 'app') !== 'AtlasDex') return { error: 'That is not an AtlasDex backup' };
+  const version = own(d, 'version');
+  if (version != null && !inRange(version, 1, BACKUP_VERSION)) {
+    return { error: 'That backup was made by a different version of AtlasDex' };
+  }
+  const present = k => own(d, k) != null;
+  for (const k of ['favorites', 'caught', 'compare', 'teams']) {
+    if (present(k) && !Array.isArray(own(d, k))) return { error: `That backup is damaged (${k} is not a list)` };
+  }
+  for (const k of ['game', 'settings']) {
+    if (present(k) && !isObj(own(d, k))) return { error: `That backup is damaged (${k} is not an object)` };
+  }
+
+  /* No prototype, so a polluted Object.prototype cannot make `c.favorites` look present. */
+  const clean = Object.create(null);
+  if (present('favorites')) clean.favorites = cleanIds(own(d, 'favorites'), LIMITS.species);
+  if (present('caught'))    clean.caught = cleanIds(own(d, 'caught'), LIMITS.species);
+  if (present('compare'))   clean.compare = cleanIds(own(d, 'compare'), LIMITS.pokemon).slice(0, 2);
+  const teams = present('teams') ? sanitizeTeams(own(d, 'teams')) : null;
+  if (teams && teams.length) {
+    clean.teams = teams;
+    clean.activeTeam = clampTeamIndex(own(d, 'activeTeam'), teams.length);
+  }
+  if (present('game')) clean.game = sanitizeGame(own(d, 'game'));
+  const theme = own(own(d, 'settings'), 'theme'), shiny = own(own(d, 'settings'), 'shiny');
+  if (theme === 'light' || theme === 'dark') clean.theme = theme;
+  if (typeof shiny === 'boolean') clean.shiny = shiny;
+  return { clean };
+}
+
+function paintShinyButton() {
+  $('shinyButton').setAttribute('aria-pressed', String(state.shiny));
+  $('shinyButton').classList.toggle('on', state.shiny);
+}
+
 function importData(file) {
+  if (file.size > IMPORT_MAX_BYTES) { toast('That file is too large to be an AtlasDex backup'); return; }
   const reader = new FileReader();
+  reader.onerror = () => toast('Could not read that file');
   reader.onload = () => {
     let d;
     try { d = JSON.parse(reader.result); } catch { toast('That file is not valid JSON'); return; }
-    if (d.app !== 'AtlasDex') { toast('That is not an AtlasDex backup'); return; }
+    const { clean: c, error } = sanitizeBackup(d);
+    if (error) { toast(error); return; }
     if (!confirm('Replace your current favorites, living dex and teams with this backup?')) return;
 
-    if (Array.isArray(d.favorites)) { state.favorites = new Set(d.favorites); store('atlasdex:favorites', d.favorites); }
-    if (Array.isArray(d.caught))    { state.caught = new Set(d.caught); store('atlasdex:caught', d.caught); }
-    if (Array.isArray(d.teams) && d.teams.length) { state.teams = d.teams; state.activeTeam = d.activeTeam || 0; saveTeams(); }
-    if (Array.isArray(d.compare))   { state.compare = d.compare; store('atlasdex:compare', d.compare); }
-    if (d.game)                     { state.gameStats = d.game; store('atlasdex:game', d.game); }
-    if (d.settings?.theme)          { state.theme = d.settings.theme; document.body.classList.toggle('light', state.theme === 'light'); store('atlasdex:theme', state.theme); }
+    if (c.favorites) { state.favorites = new Set(c.favorites); store('atlasdex:favorites', c.favorites); }
+    if (c.caught)    { state.caught = new Set(c.caught); store('atlasdex:caught', c.caught); }
+    if (c.teams) {
+      state.teams = c.teams; state.activeTeam = c.activeTeam;
+      state.teamFailed.clear();
+      saveTeams();
+    }
+    if (c.compare)   { state.compare = c.compare; store('atlasdex:compare', c.compare); }
+    if (c.game)      { state.gameStats = c.game; store('atlasdex:game', c.game); }
+    if (c.theme) {
+      state.theme = c.theme;
+      document.body.classList.toggle('light', state.theme === 'light');
+      store('atlasdex:theme', state.theme);
+    }
+    if (typeof c.shiny === 'boolean') {
+      state.shiny = c.shiny;
+      store('atlasdex:shiny', state.shiny);
+      paintShinyButton();
+    }
     syncCounts();
     toast('Backup restored');
     route();
@@ -2481,7 +2732,7 @@ const SHOWDOWN_STAT = {
 };
 
 function showdownExport() {
-  const t = state.teams[state.activeTeam];
+  const t = state.teams[activeIdx()];
   if (!t?.members.length) { toast('This team is empty'); return; }
 
   const text = t.members.map(m => {
@@ -2516,11 +2767,19 @@ function route() {
 
   if (hash.startsWith('#/pokemon/')) {
     const id = Number(hash.split('/')[2]);
-    if (state.list.length) openPokemon(id);
-    return;
+    if (!state.list.length) return;
+    /* A hand-edited id that is not a real species falls through to the home view
+       instead of leaving the page blank. */
+    if (Number.isInteger(id) && id >= 1 && id <= state.list.length) { openPokemon(id); return; }
   }
   const ent = hash.match(/^#\/(move|ability|item)\/(.+)$/);
-  if (ent) { if (state.list.length) openEntity(ent[1], decodeURIComponent(ent[2])); return; }
+  if (ent) {
+    /* The name goes straight into an API path, and a hand-edited or shared link
+       can say anything (including a malformed %-escape, which would throw). */
+    let name = '';
+    try { name = decodeURIComponent(ent[2]); } catch {}
+    if (SLUG.test(name)) { if (state.list.length) openEntity(ent[1], name); return; }
+  }
 
   if (state.modalId || state.entity || !$('overlay').hidden) closeModal();
 
@@ -2545,9 +2804,9 @@ function route() {
 
 async function init() {
   migrateTeams();
+  sanitizeLoadedState();
   document.body.classList.toggle('light', state.theme === 'light');
-  $('shinyButton').setAttribute('aria-pressed', String(state.shiny));
-  $('shinyButton').classList.toggle('on', state.shiny);
+  paintShinyButton();
 
   TYPES.forEach(t => $('typeFilter').insertAdjacentHTML('beforeend',
     `<option value="${t}">${title(t)}</option>`));
@@ -2734,23 +2993,27 @@ document.addEventListener('click', e => {
 
   const ctab = hit('[data-calctab]'); if (ctab) { state.calcTab = ctab.dataset.calctab; renderCalculators(); return; }
 
+  /* Retry forgets which members failed, then renderTeam() tries each once more. */
+  if (hit('[data-teamretry]')) { state.teamFailed.clear(); renderTeam(); return; }
   const tsel = hit('[data-teamsel]');
-  if (tsel) { state.activeTeam = Number(tsel.dataset.teamsel); saveTeams(); renderTeam(); return; }
+  if (tsel) { state.activeTeam = clampTeamIndex(Number(tsel.dataset.teamsel), state.teams.length); saveTeams(); renderTeam(); return; }
   if (hit('[data-teamnew]')) {
     if (state.teams.length >= 8) { toast('Maximum of 8 teams'); return; }
     state.teams.push({ name: 'Team ' + (state.teams.length + 1), members: [] });
     state.activeTeam = state.teams.length - 1; saveTeams(); renderTeam(); return;
   }
   if (hit('[data-teamrename]')) {
-    const name = prompt('Team name:', state.teams[state.activeTeam].name);
-    if (name && name.trim()) { state.teams[state.activeTeam].name = name.trim().slice(0, 24); saveTeams(); renderTeam(); }
+    const team = state.teams[activeIdx()];
+    const name = prompt('Team name:', team.name);
+    if (name && name.trim()) { team.name = name.trim().slice(0, 24); saveTeams(); renderTeam(); }
     return;
   }
   if (hit('[data-teamdel]')) {
     if (state.teams.length < 2) return;
-    if (!confirm(`Delete "${state.teams[state.activeTeam].name}"?`)) return;
-    state.teams.splice(state.activeTeam, 1);
-    state.activeTeam = Math.max(0, state.activeTeam - 1);
+    const at = activeIdx();
+    if (!confirm(`Delete "${state.teams[at].name}"?`)) return;
+    state.teams.splice(at, 1);
+    state.activeTeam = Math.max(0, at - 1);
     saveTeams(); renderTeam(); toast('Team deleted'); return;
   }
   if (hit('[data-showdown]')) { showdownExport(); return; }
