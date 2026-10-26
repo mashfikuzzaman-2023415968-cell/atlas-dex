@@ -333,11 +333,25 @@ function memberStats(m) {
 /* SHARED MARKUP                                                       */
 /* ------------------------------------------------------------------ */
 
-function art(id, cls = '') {
+/* Neutral stand-in for a silhouette whose artwork failed twice. It must never
+   carry the Pokémon's name, so a broken image cannot give the answer away. */
+const MYSTERY_IMG = 'data:image/svg+xml,' + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="44"/>'
+  + '<text x="50" y="68" font-size="56" font-weight="800" text-anchor="middle" fill="#fff" '
+  + 'font-family="sans-serif">?</text></svg>');
+
+/* crossorigin="anonymous" makes the request CORS (raw.githubusercontent.com sends
+   Access-Control-Allow-Origin: *), so the service worker sees a real status and
+   never caches an opaque or failed response. `mystery` is for the game's
+   unrevealed silhouette: neutral alt text and a name-free failure placeholder. */
+function art(id, cls = '', mystery = false) {
   const name = safe(pokeName(id) || 'Pokémon');
   const fallback = `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/${state.shiny ? 'shiny/' : ''}${id}.png`;
-  return `<img class="${cls}" loading="lazy" src="${sprite(id, state.shiny)}" alt="${name} artwork"
-    onerror="this.onerror=null;this.src='${fallback}'">`;
+  const onerror = mystery
+    ? `this.onerror=function(){this.onerror=null;this.src='${MYSTERY_IMG}'};this.src='${fallback}'`
+    : `this.onerror=null;this.src='${fallback}'`;
+  return `<img class="${cls}" loading="lazy" crossorigin="anonymous" src="${sprite(id, state.shiny)}"
+    alt="${mystery ? 'Mystery Pokémon silhouette' : name + ' artwork'}" onerror="${onerror}">`;
 }
 function typeBadge(t) {
   return `<span class="type" style="--type-color:${COLORS[t] || '#8a9ab1'}">${safe(title(t))}</span>`;
@@ -880,7 +894,7 @@ function showTab() {
         <div class="detail-genus">${safe(genus)}</div>
         ${formBar}
       </div>
-      <img src="${safe(state.shiny
+      <img crossorigin="anonymous" src="${safe(state.shiny
         ? (d.sprites.other?.['official-artwork']?.front_shiny || sprite(fid, true))
         : (d.sprites.other?.['official-artwork']?.front_default || sprite(fid)))}" alt="${safe(d.name)}">
     </div>
@@ -1423,8 +1437,18 @@ function dexUrls() {
   return urls;
 }
 
+/* How many of the full-dex records (exactly the URLs dexUrls() lists) are on
+   disk. The store also holds moves, items, abilities, chains and encounters,
+   so a raw record count would call the dex "ready" after browsing the items. */
+async function dexCachedCount() {
+  const keys = new Set((await idbKeys()) || []);
+  let n = 0;
+  for (const u of dexUrls()) if (keys.has(u)) n++;
+  return n;
+}
+
 async function storageReport() {
-  const entries = await idbCount();
+  const entries = await dexCachedCount();
   let used = null, quota = null;
   try {
     if (navigator.storage?.estimate) {
@@ -1437,37 +1461,59 @@ async function storageReport() {
 
 const mb = n => n == null ? '—' : (n / 1048576).toFixed(0) + ' MB';
 
-async function startDownload() {
-  if (state.dl.running) return;
-  try { await navigator.storage?.persist?.(); } catch {}
+/* One label for both the first render and the live progress ticks. */
+function dlProgress(done, total) {
+  const pct = total ? Math.min(100, done / total * 100) : 0;
+  return { pct, text: `${done.toLocaleString()} / ${total.toLocaleString()} records · ${pct.toFixed(0)}%` };
+}
 
+function dlButtonHtml(done, total) {
+  if (state.dl.running) return `<button class="secondaryaction" data-dlstop="1">Pause download</button>`;
+  const ready = total > 0 && done >= total;
+  return `<button class="primaryaction" data-dlstart="1">${done > 0 && !ready ? 'Resume download' : ready ? 'Refresh cache' : 'Download full dex'}</button>`;
+}
+
+async function startDownload() {
+  /* Claim the download before the first await: renderOffline() runs from the
+     same click, and a second click must not start a second concurrent run. */
+  if (state.dl.running) return;
   const urls = dexUrls();
+  const dl = state.dl = { running: true, done: 0, total: urls.length, failed: 0, stop: false, offline: false };
+  const startBtn = document.querySelector('[data-dlstart]');
+  if (startBtn) startBtn.outerHTML = dlButtonHtml(0, urls.length);
+  renderOffline();
+
+  try { await navigator.storage?.persist?.(); } catch {}
   const have = new Set((await idbKeys()) || []);
   const todo = urls.filter(u => !have.has(u));
-
-  state.dl = { running: true, done: urls.length - todo.length, total: urls.length, stop: false };
+  dl.done = urls.length - todo.length;
   paintProgress();
 
   await pool(todo, 6, async url => {
-    if (state.dl.stop) return;
-    await get(url);
-    state.dl.done++;
-    if (state.dl.done % 5 === 0) paintProgress();
+    if (dl.stop) return;
+    /* A record that is not on disk needs the network; going offline pauses
+       cleanly instead of counting every remaining record as a failure. */
+    if (navigator.onLine === false) { dl.offline = true; dl.stop = true; return; }
+    try { await get(url); dl.done++; } catch { dl.failed++; }
+    if ((dl.done + dl.failed) % 5 === 0) paintProgress();
   });
 
-  const stopped = state.dl.stop;
-  state.dl.running = false;
+  dl.running = false;
+  paintProgress();
   if (state.mode === 'offline') renderOffline();
-  toast(stopped ? 'Download paused — progress is saved' : 'Offline dex ready ◍');
+  if (dl.offline) toast('You are offline — download paused, progress is saved');
+  else if (dl.stop) toast('Download paused — progress is saved');
+  else if (dl.failed) toast(`${dl.failed} record${dl.failed === 1 ? '' : 's'} failed to download — resume to retry`);
+  else toast('Offline dex ready ◍');
 }
 
 function paintProgress() {
   const bar = document.querySelector('#dlBar > div');
   const label = $('dlLabel');
   if (!bar || !label) return;
-  const pct = state.dl.total ? state.dl.done / state.dl.total * 100 : 0;
+  const { pct, text } = dlProgress(state.dl.done, state.dl.total);
   bar.style.width = pct.toFixed(1) + '%';
-  label.textContent = `${state.dl.done.toLocaleString()} / ${state.dl.total.toLocaleString()} records · ${pct.toFixed(0)}%`;
+  label.textContent = text;
 }
 
 async function renderOffline() {
@@ -1478,9 +1524,12 @@ async function renderOffline() {
   const { entries, used, quota } = await storageReport();
   if (state.mode !== 'offline') return;
 
+  /* While a download runs its own counter is the truth; otherwise it is the
+     dex records actually present in IndexedDB. */
   const total = state.list.length * 2;
-  const pct = total ? Math.min(100, entries / total * 100) : 0;
-  const ready = pct >= 99;
+  const done = state.dl.running ? state.dl.done : entries;
+  const { pct, text } = dlProgress(done, total);
+  const ready = total > 0 && done >= total && !state.dl.running;
 
   $('panel').innerHTML = `
     <div class="kicker">DATA</div>
@@ -1492,15 +1541,13 @@ async function renderOffline() {
       <div class="off-top">
         <div>
           <small>${ready ? 'FULLY AVAILABLE OFFLINE' : state.dl.running ? 'DOWNLOADING' : 'PARTIALLY CACHED'}</small>
-          <strong id="dlLabel">${entries.toLocaleString()} / ${total.toLocaleString()} records · ${pct.toFixed(0)}%</strong>
+          <strong id="dlLabel">${text}</strong>
         </div>
         <span class="off-dot ${navigator.onLine ? '' : 'off'}">${navigator.onLine ? 'Online' : 'Offline'}</span>
       </div>
       <div class="bar" id="dlBar"><div style="width:${pct}%"></div></div>
       <div class="detail-actions">
-        ${state.dl.running
-          ? `<button class="secondaryaction" data-dlstop="1">Pause download</button>`
-          : `<button class="primaryaction" data-dlstart="1">${pct > 0 && !ready ? 'Resume download' : ready ? 'Refresh cache' : 'Download full dex'}</button>`}
+        ${dlButtonHtml(done, total)}
         <button class="secondaryaction" data-dlclear="1">Clear cached data</button>
       </div>
     </div>
@@ -1580,7 +1627,37 @@ function renderMatchups() {
 /* ------------------------------------------------------------------ */
 
 const ROUND = 5;
-const todayKey = () => new Date().toISOString().slice(0, 10);
+
+/* The daily puzzle and the streak follow the player's own calendar date, so
+   "resets at midnight" is true where they live. Everyone on the same date
+   still gets the same puzzle because the seed is the date string. */
+const dayKey = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const todayKey = () => dayKey(new Date());
+/* setDate steps back one calendar day; subtracting 86 400 000 ms is an hour
+   out on a daylight-saving changeover day. */
+const yesterdayKey = () => { const d = new Date(); d.setDate(d.getDate() - 1); return dayKey(d); };
+
+/* In-progress daily, so quitting and restarting cannot replay questions whose
+   answers were already seen. Shape: { date, results: [bool], q, picked }. */
+const DAILY_KEY = 'atlasdex:daily';
+function loadDaily() {
+  const d = read(DAILY_KEY, null);
+  const valid = d && typeof d === 'object' && d.date === todayKey()
+    && Array.isArray(d.results) && d.results.length <= ROUND && d.results.every(r => typeof r === 'boolean')
+    && Number.isInteger(d.q) && d.q >= 0 && d.q < ROUND
+    && (d.results.length === d.q || d.results.length === d.q + 1)
+    && (d.picked === null || Number.isInteger(d.picked))
+    && (d.results.length === d.q) === (d.picked === null);
+  if (valid) return d;
+  if (d) clearDaily();
+  return null;
+}
+function saveDaily(g) {
+  store(DAILY_KEY, { date: g.date, results: g.results, q: g.q, picked: g.picked });
+}
+function clearDaily() {
+  try { localStorage.removeItem(DAILY_KEY); } catch {}
+}
 
 /* Deterministic PRNG so everyone gets the same daily puzzle. */
 function mulberry32(seed) {
@@ -1631,7 +1708,20 @@ function buildQuestions(mode) {
 }
 
 function startGame(mode) {
-  state.game = { mode, q: 0, questions: buildQuestions(mode), results: [], revealed: false, picked: null };
+  const g = { mode, q: 0, questions: buildQuestions(mode), results: [], revealed: false, picked: null };
+  if (mode === 'daily') {
+    g.date = todayKey();
+    /* A replay after finishing never counts, so it is not worth resuming. */
+    g.replay = state.gameStats.lastDaily === g.date;
+    const saved = g.replay ? null : loadDaily();
+    if (saved && (saved.picked === null || g.questions[saved.q].options.some(o => o.id === saved.picked))) {
+      g.results = saved.results.slice();
+      g.q = saved.q;
+      g.picked = saved.picked;
+      g.revealed = saved.picked !== null;
+    }
+  }
+  state.game = g;
   renderGame();
 }
 
@@ -1642,6 +1732,7 @@ function answerGame(id) {
   g.picked = id;
   g.revealed = true;
   g.results.push(id === q.answer.id);
+  if (g.mode === 'daily' && !g.replay) saveDaily(g);
   renderGame();
 }
 
@@ -1650,6 +1741,7 @@ function nextGame() {
   if (!g) return;
   if (g.q + 1 >= g.questions.length) { finishGame(); return; }
   g.q++; g.revealed = false; g.picked = null;
+  if (g.mode === 'daily' && !g.replay) saveDaily(g);
   renderGame();
 }
 
@@ -1661,9 +1753,9 @@ function finishGame() {
   if (g.mode === 'daily') {
     const st = state.gameStats;
     const today = todayKey();
+    clearDaily();
     if (st.lastDaily !== today) {
-      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-      st.streak = st.lastDaily === yesterday ? (st.streak || 0) + 1 : 1;
+      st.streak = st.lastDaily === yesterdayKey() ? (st.streak || 0) + 1 : 1;
       st.best = Math.max(st.best || 0, st.streak);
       st.lastDaily = today;
       st.lastScore = score;
@@ -1693,6 +1785,7 @@ function renderGame() {
   syncCounts();
   const st = state.gameStats;
   const doneToday = st.lastDaily === todayKey();
+  const savedDaily = !doneToday && !state.game ? loadDaily() : null;
   const header = `<div class="kicker">DAILY CHALLENGE</div>
     <h2 class="panel-title">Who's That Pokémon?</h2>
     <div class="game-stats">
@@ -1705,12 +1798,13 @@ function renderGame() {
   if (!state.game) {
     $('panel').innerHTML = `${header}
       <p class="dex-desc">Identify the Pokémon from its silhouette. The daily challenge is five
-      Pokémon, the same five for everyone, and it resets at midnight.</p>
+      Pokémon, the same five for everyone, and it resets at midnight your time.</p>
       <div class="game-menu">
         <button class="gamecard ${doneToday ? 'done' : ''}" data-game="daily">
           <span class="gc-icon">◐</span>
-          <strong>${doneToday ? "Replay today's challenge" : "Play today's challenge"}</strong>
-          <small>${doneToday ? `You scored ${st.lastScore}/${ROUND} — replaying won't change your streak` : `5 silhouettes · builds your streak`}</small>
+          <strong>${doneToday ? "Replay today's challenge" : savedDaily ? "Resume today's challenge" : "Play today's challenge"}</strong>
+          <small>${doneToday ? `You scored ${st.lastScore}/${ROUND} — replaying won't change your streak`
+            : savedDaily ? `${savedDaily.results.length}/${ROUND} answered — those answers are locked in` : `5 silhouettes · builds your streak`}</small>
         </button>
         <button class="gamecard" data-game="endless">
           <span class="gc-icon">∞</span>
@@ -1766,7 +1860,7 @@ function renderGame() {
     </div>
 
     <div class="silhouette ${g.revealed ? 'revealed' : ''}">
-      ${art(q.answer.id)}
+      ${art(q.answer.id, '', !g.revealed)}
     </div>
 
     <div class="guess-grid">
@@ -1863,7 +1957,7 @@ function browseRow(kind, r) {
   if (kind === 'item') {
     const img = d?.sprites?.default;
     return `<button class="dexrow item" data-entity="item:${safe(r.name)}">
-      <span class="dx-img">${img ? `<img src="${safe(img)}" alt="" loading="lazy">` : ''}</span>
+      <span class="dx-img">${img ? `<img crossorigin="anonymous" src="${safe(img)}" alt="" loading="lazy">` : ''}</span>
       <span class="dx-name">${safe(title(r.name))}</span>
       <span class="dx-cat">${d ? safe(title(d.category?.name || '')) : ''}</span>
       <span class="dx-num">${d ? (d.cost ? '₽' + d.cost.toLocaleString() : '—') : ''}</span>
@@ -2004,7 +2098,7 @@ async function openEntity(kind, name) {
       <div>${mons.map(p => `<span class="pill" data-openname="${safe(p.pokemon.name)}">${safe(title(p.pokemon.name))}${p.is_hidden ? ' · hidden' : ''}</span>`).join('')}</div>`;
   } else {
     const img = d.sprites?.default;
-    body = `${img ? `<div class="itemart"><img src="${safe(img)}" alt="${safe(d.name)}"></div>` : ''}
+    body = `${img ? `<div class="itemart"><img crossorigin="anonymous" src="${safe(img)}" alt="${safe(d.name)}"></div>` : ''}
       <div class="facts">
         <div class="fact"><small>CATEGORY</small><strong>${safe(title(d.category?.name || '—'))}</strong></div>
         <div class="fact"><small>COST</small><strong>${d.cost ? '₽' + d.cost.toLocaleString() : '—'}</strong></div>
@@ -2343,7 +2437,7 @@ async function openComparison() {
       const prof = defensiveProfile(types);
       const weak = TYPES.filter(t => prof[t] > 1);
       return `<div class="comparebox">
-        <img src="${sprite(p.id, state.shiny)}" alt="${safe(p.name)}">
+        <img crossorigin="anonymous" src="${sprite(p.id, state.shiny)}" alt="${safe(p.name)}">
         <h3>${safe(title(p.name))} <small>${pad(p.id)}</small></h3>
         <div class="types" style="justify-content:center">${p.types.map(t => typeBadge(t.type.name)).join('')}</div>
         <div class="cmp-total">${total} <small>TOTAL</small></div>
@@ -2757,7 +2851,7 @@ document.addEventListener('click', e => {
   if (hit('[data-export]'))   { exportData(); return; }
   if (hit('[data-import]'))   { $('importFile').click(); return; }
 
-  if (hit('[data-dlstart]')) { startDownload(); renderOffline(); return; }
+  if (hit('[data-dlstart]')) { startDownload(); return; }
   if (hit('[data-dlstop]'))  { state.dl.stop = true; toast('Pausing…'); return; }
   if (hit('[data-dlclear]')) {
     if (confirm('Clear all cached Pokémon data from this device?')) {
@@ -2815,6 +2909,7 @@ document.addEventListener('click', e => {
 
 window.addEventListener('online',  () => { toast('Back online'); if (state.mode === 'offline') renderOffline(); });
 window.addEventListener('offline', () => {
+  if (state.dl.running) { state.dl.offline = true; state.dl.stop = true; }
   toast('Offline — showing data saved on this device');
   if (state.mode === 'offline') renderOffline();
 });
