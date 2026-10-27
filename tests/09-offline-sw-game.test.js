@@ -73,7 +73,7 @@ function makeSW() {
       location: { origin: 'https://x.test', href: BASE + 'sw.js' },
       addEventListener: (t, fn) => { handlers[t] = fn; },
       skipWaiting: () => { stats.skipped++; },
-      clients: { claim: () => { stats.claimed++; } }
+      clients: { claim: () => { stats.claimed++; }, matchAll: async () => (sandbox.openClients || []).map(id => ({ id })) }
     },
     caches: {
       open: async n => mkCache(n),
@@ -102,7 +102,7 @@ function makeSW() {
     if (!noWait) await Promise.all(waits);
     return { responded, res };
   }
-  const fetchEv = (url, o = {}) => fire('fetch', { request: { url, method: o.method || 'GET', mode: o.mode || 'cors' } }, o.noWait);
+  const fetchEv = (url, o = {}) => fire('fetch', { request: { url, method: o.method || 'GET', mode: o.mode || 'cors' }, clientId: o.clientId || 'page-loaded-under-worker' }, o.noWait);
   const cacheMap = name => store.get(name) || new Map();
   const read = expr => { try { return vm.runInContext(expr, ctx); } catch { return undefined; } };
   return { sandbox, store, stats, fire, fetchEv, cacheMap, read };
@@ -802,6 +802,21 @@ async function reviewFollowUps() {
     const r = await sw.fetchEv(js);   // resolves only once every waitUntil promise has settled
     ok('a network slower than the timeout is answered from the cache', r.res.body === 'old-app');
     ok('the worker is kept alive (waitUntil) until the late response refreshes the cache', sw.cacheMap(sw.read('SHELL_CACHE')).get(js).body === 'new-app');
+  }
+
+  {
+    /* First visit: the page was already open when the worker claimed it. */
+    const art = 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/1.png';
+    const sw = makeSW();
+    sw.sandbox.openClients = ['first-visit-tab'];
+    await sw.fire('activate', {});
+    ok('activate still claims the pages that are open', sw.stats.claimed === 1);
+    sw.sandbox.fetchImpl = async () => new MResponse('png', { type: 'cors' });
+    const early = await sw.fetchEv(art, { clientId: 'first-visit-tab' });
+    ok('artwork for a page open before the claim is left to the browser (not intercepted)', !early.responded);
+    ok('...and nothing is cached on its behalf', !sw.cacheMap('atlasdex-art-v2').has(norm(art)));
+    const later = await sw.fetchEv(art, { clientId: 'next-page-load' });
+    ok('artwork for pages loaded under the worker is still served and cached', later.responded && later.res.body === 'png' && sw.cacheMap('atlasdex-art-v2').has(norm(art)));
   }
 
   console.log('\n--- DAILY DATES: review follow-ups ---');

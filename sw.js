@@ -27,10 +27,21 @@ self.addEventListener('install', e => {
   self.skipWaiting();
 });
 
+/* Pages that were already open when this worker took control. In Chrome,
+   answering their artwork requests (images that started loading before the
+   claim) left most cards broken on a first visit, falling back to the small
+   sprites, although every response was a good 200. They load artwork
+   straight from the network; caching starts with the next page load. */
+const claimedMidLoad = new Set();
+
 self.addEventListener('activate', e => {
-  e.waitUntil(caches.keys().then(keys =>
-    Promise.all(keys.filter(k => !KEEP.includes(k)).map(k => caches.delete(k)))));
-  self.clients.claim();
+  e.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.filter(k => !KEEP.includes(k)).map(k => caches.delete(k)));
+    const open = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    open.forEach(c => claimedMidLoad.add(c.id));
+    await self.clients.claim();
+  })());
 });
 
 /* Oldest entries first: Cache.keys() returns them in insertion order. */
@@ -111,6 +122,7 @@ self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
 
   if (url.hostname === ART_HOST) {
+    if (claimedMidLoad.has(e.clientId)) return;
     e.respondWith(artResponse(e));
     return;
   }
