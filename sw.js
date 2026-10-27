@@ -1,4 +1,4 @@
-const SHELL_CACHE = 'atlasdex-shell-v5';
+const SHELL_CACHE = 'atlasdex-shell-v6';
 /* v2: v1 may hold opaque (unverifiable, quota-heavy) entries from before the
    artwork was requested with CORS. Bumping the name purges them on activate. */
 const ART_CACHE   = 'atlasdex-art-v2';

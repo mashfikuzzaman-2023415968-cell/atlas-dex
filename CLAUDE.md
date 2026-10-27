@@ -356,7 +356,7 @@ npm test && git add -A && git commit -m "..." && git push
 ### Deployment checklist — do this every time
 
 1. `npm test` passes.
-2. **Bump `SHELL_CACHE` in `sw.js`** (`atlasdex-shell-v5` → `v6`) on each deploy, and
+2. **Bump `SHELL_CACHE` in `sw.js`** (`atlasdex-shell-v6` → `v7`) on each deploy, and
    `ART_CACHE` (currently `atlasdex-art-v2`) only if artwork handling changed. This is still
    recommended because `activate` deletes caches whose names are not in `KEEP`, which purges
    stale shell entries (such as a removed file). It is no longer the only thing between a
