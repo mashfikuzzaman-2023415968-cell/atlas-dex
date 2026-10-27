@@ -468,6 +468,42 @@ const hpAt = { 1: '12', 10: '35', 100: '261' }, atkAt = { 1: '7', 10: '31', 100:
 
   /* ================================================================ */
   console.log('\n--- CSS for the new picker ---');
+  await section('Review follow-ups: other fields stay in step, focus survives, the modal syncs the view behind', async () => {
+    await c.go('#/calc');
+    c.click(c.q('[data-calctab="catch"]')); await wait(30);
+    const maxBox = c.q('[data-calc="cMaxHp"]'), curBox = c.q('[data-calc="cHp"]');
+    c.chg(c.q('[data-calc="cRate"]'), '45'); c.chg(c.q('[data-calc="cBall"]'), 'Poké Ball'); c.chg(c.q('[data-calc="cStatus"]'), 'None');
+    c.chg(maxBox, '100'); c.chg(curBox, '80');
+    ok('80 of 100 HP is better than full HP (above 11.9%)', parseFloat(resultText(c)) > 11.9);
+    maxBox.focus(); c.typeIn(maxBox, '3'); c.typeIn(maxBox, '30');
+    /* Typing "30" passes through "3": that must not drag current HP down for good. */
+    ok('while max HP is being typed, current HP is left alone (box shows 80)', curBox.value === '80' && c.d.activeElement === maxBox);
+    ok('...and the result already uses min(current, max): 30 of 30 is full HP, 11.9%', resultText(c) === '11.9%');
+    c.ev(maxBox, 'change');
+    ok('committing max HP 30 then pulls current HP down to 30, not to the passing 3', curBox.value === '30' && maxBox.value === '30');
+
+    c.click(c.q('[data-calctab="breeding"]'));
+    await waitFor(() => c.q('[data-calc="eggGroup"]') && /compatible species/.test(c.$('calcBody').textContent));
+    const eg = c.q('[data-calc="eggGroup"]');
+    eg.focus(); c.chg(eg, 'dragon');
+    await waitFor(() => c.d.activeElement === c.q('[data-calc="eggGroup"]') && c.d.activeElement.value === 'dragon');
+    ok('choosing an egg group keeps keyboard focus on the egg-group list',
+      c.d.activeElement === c.q('[data-calc="eggGroup"]') && c.d.activeElement.value === 'dragon');
+
+    c.click(c.q('[data-calctab="stats"]')); await wait(30);
+    c.chg(c.q('#panel [data-calc="level"]'), '50');
+    await c.go('#/pokemon/3');
+    await waitFor(() => c.q('[data-tab="stats"]'));
+    c.click(c.q('[data-tab="stats"]'));
+    await waitFor(() => c.q('#modalContent [data-calc="level"]'));
+    const modalLevel = c.q('#modalContent [data-calc="level"]');
+    c.typeIn(modalLevel, '77'); c.ev(modalLevel, 'change');
+    c.$('closeModal').dispatchEvent(new c.w.MouseEvent('click', { bubbles: true }));
+    await wait(30);
+    ok('a level set in the modal shows in the Calculators view behind it once the modal closes',
+      c.q('#panel [data-calc="level"]').value === '77' && /level 77/.test(c.$('panel').textContent));
+  });
+
   const css = fs.readFileSync(dir + '/styles.css', 'utf8');
   const v6 = css.slice(css.indexOf('/* ===== v6 · calculator picker and damage rolls ===== */'));
   ok('[2.3] the picker has a versioned v6 CSS block', v6.length > 0 && css.includes('/* ===== v6 · calculator picker and damage rolls ===== */'));

@@ -29,13 +29,19 @@ const MOVES_OF_1 = [
   { move: { name: 'tackle' }, version_group_details: [vg(7, 'level-up', 30), vg(4, 'level-up', 9)] },
   { move: { name: 'surf' }, version_group_details: [vg(5, 'tutor', 0)] }
 ];
+/* Version-group ids do not follow release order: 28/29 are the Japanese Red/Green and
+   Blue (the oldest games) and 12/13 Colosseum and XD (before Black/White, id 11). */
+const MOVES_OF_50 = [
+  { move: { name: 'scratch' }, version_group_details: [vg(25, 'level-up', 9), vg(28, 'level-up', 5), vg(29, 'level-up', 6)] },
+  { move: { name: 'growl' }, version_group_details: [vg(11, 'level-up', 33), vg(12, 'level-up', 40), vg(13, 'level-up', 41)] }
+];
 const mkPoke = (id, name, sid, types) => ({
   id, name, height: 10, weight: 100, base_experience: 60, species: { url: '/pokemon-species/' + sid + '/' },
   types: types.map(t => ({ type: { name: t } })),
   stats: [['hp', 60], ['attack', 80], ['defense', 70], ['special-attack', 90], ['special-defense', 75], ['speed', 100]]
     .map(([n, v]) => ({ base_stat: v, effort: 0, stat: { name: n } })),
   abilities: [{ ability: { name: 'blaze' }, is_hidden: false }],
-  moves: id === 1 ? MOVES_OF_1
+  moves: id === 1 ? MOVES_OF_1 : id === 50 ? MOVES_OF_50
     : [{ move: { name: 'ember' }, version_group_details: [vg(1, 'level-up', 7)] }],
   sprites: { other: { 'official-artwork': { front_default: 'x.png', front_shiny: 's.png' } } },
   cries: { latest: 'c.ogg' }
@@ -569,6 +575,35 @@ const modalTitle = a => a.d.querySelector('#modalContent h2')?.textContent.repla
     eq('exactly the 94 PokéAPI legendary/mythical ids', ids, EXPECTED);
     eq('Paradox species PokéAPI does not flag are excluded',
       [1009, 1010, 1020, 1021, 1022, 1023].filter(id => ids.includes(id)), []);
+    eq('no uncaught errors', a.errs, []);
+  });
+
+  /* ================= follow-ups from the independent review ================= */
+  await sec('Review follow-ups: move levels by release order, bad links cleared, labels', async () => {
+    const a = await boot({ hash: '#/pokemon/50' });
+    await waitFor(() => !a.$('overlay').hidden && a.d.querySelector('[data-tab="moves"]'));
+    a.click(a.d.querySelector('[data-tab="moves"]'));
+    await waitFor(() => a.d.querySelector('.moverow[data-move="growl"]'));
+    const lv = name => a.d.querySelector(`.moverow[data-move="${name}"] .mv-lv`)?.textContent.trim();
+    eq('the level comes from the newest game by release (Scarlet/Violet), not the Japanese Red/Green ids 28/29', lv('scratch'), '9');
+    eq('Black/White (id 11) is newer than Colosseum and XD (ids 12, 13)', lv('growl'), '33');
+    closeAll(a);
+
+    for (const h of ['#/pokemon/0', '#/pokemon/99999', '#/pokemon/%E0%A4%A', '#/pokemon/abc']) {
+      a.w.location.hash = h;
+      await waitFor(() => a.w.location.hash === '#/' && !a.$('listSection').hidden);
+      eq(`${h} is replaced by #/ in the address bar`, a.w.location.hash, '#/');
+    }
+
+    a.click(a.d.querySelector('[data-team="1"]'));
+    await waitFor(() => a.$('teamCount').textContent === '1');
+    a.w.location.hash = '#/team';
+    await waitFor(() => a.d.querySelector('.slot-remove'));
+    eq('the ✕ remove button names the Pokémon it removes', a.d.querySelector('.slot-remove').getAttribute('aria-label'), 'Remove Mon1 from team');
+    a.click(a.d.querySelector('[data-edit="1"]'));
+    await waitFor(() => a.d.querySelectorAll('[data-moveslot]').length === 4);
+    eq('each move-slot select has an accessible name', [...a.d.querySelectorAll('[data-moveslot]')].map(s => s.getAttribute('aria-label')),
+      ['Move 1', 'Move 2', 'Move 3', 'Move 4']);
     eq('no uncaught errors', a.errs, []);
   });
 

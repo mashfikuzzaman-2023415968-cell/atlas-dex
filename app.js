@@ -977,6 +977,10 @@ function closeModal() {
   /* The editor changes moves and EVs behind the Team Builder, and it can be
      dismissed with Escape or the backdrop as well as Done: refresh on any exit. */
   if (wasEditing && state.mode === 'team') renderTeam();
+  /* The modal's Stats tab shares level, nature, IV and EV with the Calculators
+     view behind it; repaint that view's fields and result in place (a full
+     re-render would destroy the element focus is about to return to). */
+  if (wasOpen && state.mode === 'calc' && $('calcResult')) { paintCalcResult(); syncCalcInputs($('panel')); }
   if (wasOpen) { restoreFocus(modalOpener); modalOpener = null; }
 }
 
@@ -1049,18 +1053,25 @@ function breedingPanel(d, s) {
 }
 
 /* ---- tab: moves ---- */
+/* PokéAPI's own release order for version groups 1-29 (its `order` field).
+   Ids do not follow release: Colosseum and XD (12, 13) predate Black/White,
+   and the Japanese Red/Green and Blue (28, 29) are the oldest of all. Ids
+   beyond the table are newer games, so they sort after everything listed. */
+const VG_ORDER = [3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 9, 10, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 1, 2];
+const vgOrder = id => (id >= 1 && id <= VG_ORDER.length ? VG_ORDER[id - 1] : id > 0 ? 1000 + id : 0);
+
 function movesPanel(d) {
   /* One row per (move, learn method): a move taught by level-up in one game and
      by TM in another belongs under both chips. For each method keep the most
      recent version group, so level-up shows the level from the newest game
-     that teaches it. Version-group ids ascend with release order; the array
-     position breaks ties and covers payloads without the URL. */
+     that teaches it. The array position breaks ties and covers payloads
+     without the URL. */
   const rows = [];
   for (const m of d.moves) {
     const best = new Map();
     (m.version_group_details || []).forEach(vg => {
       const method = vg?.move_learn_method?.name || 'unknown';
-      const order = idOf(vg?.version_group?.url);
+      const order = vgOrder(idOf(vg?.version_group?.url));
       const cur = best.get(method);
       if (!cur || order >= cur.order) best.set(method, { order, level: vg?.level_learned_at || 0 });
     });
@@ -1625,7 +1636,7 @@ function paintMemberEditor() {
     const chosen = m.moves[i] || '';
     const mv = chosen ? state.moves.get(chosen) : null;
     return `<div class="moveslot">
-      <select data-moveslot="${i}">
+      <select data-moveslot="${i}" aria-label="Move ${i + 1}">
         <option value="">— empty slot —</option>
         ${learnable.map(n => `<option value="${safe(n)}" ${n === chosen ? 'selected' : ''}>${safe(title(n))}</option>`).join('')}
       </select>
@@ -3270,6 +3281,8 @@ function route() {
     /* A hand-edited id that is not a real species falls through to the home view
        instead of leaving the page blank. */
     if (Number.isInteger(id) && id >= 1 && id <= state.list.length) { openPokemon(id); return; }
+    /* Leave no bad link in the address bar to be bookmarked or shared. */
+    history.replaceState(null, '', '#/');
   }
   const ent = hash.match(/^#\/(move|ability|item)\/(.+)$/);
   if (ent) {
@@ -3420,14 +3433,17 @@ $('paletteButton').addEventListener('click', openPalette);
 /* A calculator control's new value into state. Number fields are clamped, and an
    empty or unparsable value is ignored (returns false), so a half-typed field never
    writes 0 into state. */
-function setCalcField(el) {
+function setCalcField(el, committed = false) {
   const key = el.dataset.calc;
   if (el.type === 'checkbox') { state.calc[key] = el.checked; return true; }
   if (el.type !== 'number') { state.calc[key] = el.value; return true; }
   const v = clampCalc(key, el.value);
   if (v == null) return false;
   state.calc[key] = v;
-  if (key === 'cMaxHp') state.calc.cHp = Math.min(state.calc.cHp, v);   // current HP follows a lowered max
+  /* Current HP follows a lowered max only once the max is committed: typing
+     "30" passes through "3", which must not drag current HP down for good.
+     Until then the result uses min(current, max) and every box shows state. */
+  if (committed && key === 'cMaxHp') state.calc.cHp = Math.min(state.calc.cHp, v);
   return true;
 }
 
@@ -3449,22 +3465,28 @@ function refreshCalc(el) {
   if (el.closest('#modalContent')) { paintActualStats(); return; }
   if (state.mode !== 'calc') return;
   if (paintCalcResult()) return;
-  if (state.calcTab === 'breeding') { renderCalculators(); return; }
+  const key = el.dataset.calc;
+  const refocus = () => document.querySelector(`[data-calc="${CSS.escape(key)}"]`)?.focus();
+  /* The egg-group list is fetched, so the Breeding body is rebuilt; focus goes
+     back to the changed control once it exists again. */
+  if (state.calcTab === 'breeding') { renderCalculators().then(refocus); return; }
   /* Tabs without a result region (Team Damage) repaint their body, then hand focus
      back to the same control so keyboard users are not dropped. */
-  const key = el.dataset.calc;
   $('calcBody').innerHTML = calcBodyHtml();
-  document.querySelector(`[data-calc="${CSS.escape(key)}"]`)?.focus();
+  refocus();
 }
 
-/* Show the clamped state value in every number field of the control's container. */
-function normaliseCalcInputs(el) {
-  const root = el.closest('#modalContent') || $('panel');
-  root.querySelectorAll('input[type="number"][data-calc]').forEach(i => {
+/* Show the clamped state values in a container's calculator fields. */
+function syncCalcInputs(root) {
+  if (!root) return;
+  root.querySelectorAll('input[type="number"][data-calc], select[data-calc]').forEach(i => {
     const key = i.dataset.calc, v = state.calc[key];
     if (key === 'cHp') i.max = state.calc.cMaxHp;   // current HP can never exceed max HP
     if (v != null && String(v) !== i.value) i.value = v;
   });
+}
+function normaliseCalcInputs(el) {
+  syncCalcInputs(el.closest('#modalContent') || $('panel'));
 }
 
 /* Delegated input handling for dynamically rendered controls. Selects and
@@ -3507,7 +3529,7 @@ document.addEventListener('change', e => {
   }
   const calc = t.closest('[data-calc]');
   if (calc) {
-    setCalcField(calc);
+    setCalcField(calc, true);
     normaliseCalcInputs(calc);
     refreshCalc(calc);
   }

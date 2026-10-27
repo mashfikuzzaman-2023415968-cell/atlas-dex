@@ -43,6 +43,11 @@ r=damageRange({level:50,power:0,atk:120,def:100,stab:false,typeMult:1,crit:false
 t('status move deals 0',r.max,0);
 r=damageRange({level:50,power:80,atk:120,def:100,stab:false,typeMult:1,crit:false,burn:true});
 t('burn halves physical',r.max,22);
+// Burn on an odd value rounds .5 down like the games (pokeRound), never up:
+// L50, power 80, Atk 130, Def 100 -> floor(floor(22*80*130/100)/50)+2 = 47, and 47*2048/4096 = 23.5 -> 23.
+r=damageRange({level:50,power:80,atk:130,def:100,stab:false,typeMult:1,crit:false,burn:true});
+t('burn rounds an odd value down (47 -> 23, not 24)',r.max,23);
+t('burn on the minimum roll (floor(47*85/100) = 39 -> 19)',r.min,19);
 
 
 // --- damage rounding order (Gen 6+). Each step floors/rounds where the games do.
